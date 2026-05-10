@@ -311,32 +311,77 @@ Detected by diffing successive `ups.status` token sets:
 
 ## systemd unit
 
+The service runs as a dedicated, unprivileged system user `ups-client`. systemd does **not** create the account on its own — you have to set it up once, either manually or declaratively via `systemd-sysusers`.
+
+### 1. Create the system user
+
+Pick one of:
+
+```bash
+# Imperative (Debian/Ubuntu/Arch)
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin ups-client
+```
+
+```bash
+# Declarative — recommended; survives package reinstalls
+sudo tee /etc/sysusers.d/ups-client.conf >/dev/null <<'EOF'
+u ups-client - "ups-client service" -
+EOF
+sudo systemd-sysusers
+```
+
+Then make sure the config (and any SSH key file referenced from it) is readable by that user:
+
+```bash
+sudo install -d -o root -g ups-client -m 0750 /etc/ups-client
+sudo install -o root -g ups-client -m 0640 ups-client.example.yaml /etc/ups-client/config.yaml
+# If you use the SSH notifier:
+sudo install -o root -g ups-client -m 0640 /path/to/id_ed25519 /etc/ups-client/id_ed25519
+```
+
+### 2. Install the unit
+
 ```ini
 # /etc/systemd/system/ups-client.service
 [Unit]
 Description=UPS event client
-After=nut-server.service
+After=nut-server.service network-online.target
+Wants=network-online.target
 Requires=nut-server.service
 
 [Service]
 Type=simple
+User=ups-client
+Group=ups-client
 ExecStart=/usr/local/bin/ups-client -config /etc/ups-client/config.yaml
 Restart=on-failure
 RestartSec=5s
-User=ups-client
-Group=ups-client
-DynamicUser=yes
+
+# Hardening
+NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
-NoNewPrivileges=yes
-ReadWritePaths=
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
 ReadOnlyPaths=/etc/ups-client
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-Drop `DynamicUser=yes` (and uncomment `User=`/`Group=`) if you need a fixed UID for the SSH notifier's private-key file.
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now ups-client.service
+journalctl -u ups-client.service -f
+```
 
 ## Troubleshooting
 
