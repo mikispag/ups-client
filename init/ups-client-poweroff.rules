@@ -1,0 +1,24 @@
+// Allow the ups-client system user to trigger an immediate poweroff via
+// `systemctl poweroff`. The FSD (forced shutdown) notifier in ups-client's
+// example config invokes this when the UPS asserts FSD: at that point the
+// battery is critically low and the system has seconds to power off
+// cleanly.
+//
+// Without this rule, logind's default policy requires an active local
+// session for power-off, so the daemon's call would fail.
+//
+// Install: copy to /etc/polkit-1/rules.d/50-ups-client-poweroff.rules
+// (root:root, 0644). Polkit picks it up immediately; no daemon reload.
+
+polkit.addRule(function(action, subject) {
+    if (subject.user !== "ups-client") {
+        return null;
+    }
+    if (action.id === "org.freedesktop.login1.power-off" ||
+        action.id === "org.freedesktop.login1.power-off-multiple-sessions" ||
+        action.id === "org.freedesktop.login1.halt" ||
+        action.id === "org.freedesktop.login1.halt-multiple-sessions") {
+        return polkit.Result.YES;
+    }
+    return null;
+});

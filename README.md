@@ -512,6 +512,25 @@ PrivateTmp=yes           # private /tmp namespace
 
 Everything else (`Protect{KernelTunables,KernelModules,ControlGroups}`, `Restrict{Namespaces,Realtime}`, `LockPersonality`, `SystemCallFilter`) is omitted on purpose — those directives only block syscalls this daemon never makes.
 
+### FSD shutdown without sudo
+
+The example config ships a shell notifier that runs `systemctl --no-block poweroff` on `FSD`. The `ups-client` system user can't trigger a poweroff by default — logind's polkit policy requires an active local session, which a daemon doesn't have. The repo ships a tiny polkit rule that grants exactly the `power-off` / `halt` actions to the `ups-client` user only:
+
+```bash
+sudo install -m 0644 init/ups-client-poweroff.rules \
+    /etc/polkit-1/rules.d/50-ups-client-poweroff.rules
+```
+
+Polkit picks the rule up immediately — no daemon reload. After this:
+
+```bash
+sudo -u ups-client systemctl --no-block poweroff   # would actually power off the box
+```
+
+Skip this step if you don't want ups-client to be able to trigger a shutdown — you can drop the `poweroff` block from the shell notifier list, and `FSD` will still trigger every other configured channel (ntfy, Telegram, …).
+
+This approach is preferred over editing `/etc/sudoers.d/` (no sudo dependency, no command injection risk in the sudoers parser) and over a setuid wrapper (no separately-audited binary).
+
 ## Troubleshooting
 
 | Symptom | Likely cause |

@@ -73,11 +73,15 @@ notifications:
           {{- end }} {{ .Event }} ups={{.UPS}} status="{{.Status}}" charge={{.BatteryCharge}}% runtime={{.BatteryRuntime}}s load={{.UPSLoad}}%
       timeout: 5s
 
-    # Graceful local shutdown when the UPS hits FSD.
-    - name: shutdown
-      command: /sbin/shutdown
-      args: ["-h", "+1", "🛑 UPS event {{.Event}} — initiating shutdown"]
-      timeout: 5s
+    # Immediate local poweroff when the UPS asserts FSD. Uses systemd's
+    # logind D-Bus interface — the unprivileged ups-client user is granted
+    # permission via the polkit rule init/ups-client-poweroff.rules
+    # (install to /etc/polkit-1/rules.d/50-ups-client-poweroff.rules).
+    # No sudo, no setuid wrapper.
+    - name: poweroff
+      command: /usr/bin/systemctl
+      args: ["--no-block", "poweroff"]
+      timeout: 10s
       events: [FSD]
 
   webhook:
