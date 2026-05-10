@@ -353,21 +353,11 @@ ExecStart=/usr/local/bin/ups-client -config /etc/ups-client/config.yaml
 Restart=on-failure
 RestartSec=5s
 
-# Hardening
+# Minimal, useful hardening — drops privilege, RO rootfs, no /home, own /tmp.
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
-PrivateDevices=yes
-ProtectKernelTunables=yes
-ProtectKernelModules=yes
-ProtectControlGroups=yes
-RestrictNamespaces=yes
-RestrictRealtime=yes
-LockPersonality=yes
-SystemCallFilter=@system-service
-SystemCallErrorNumber=EPERM
-ReadOnlyPaths=/etc/ups-client
 
 [Install]
 WantedBy=multi-user.target
