@@ -173,8 +173,11 @@ func (c *Config) validate() error {
 	}{
 		{"monitor.status_interval", c.Monitor.StatusInterval, 500 * time.Millisecond, 5 * time.Minute},
 		{"monitor.snapshot_interval", c.Monitor.SnapshotInterval, time.Second, 30 * time.Minute},
-		{"monitor.nocomm_threshold", c.Monitor.NoCommThreshold, 0, time.Hour},
-		{"monitor.replbatt_debounce", c.Monitor.ReplBattDebounce, 0, 24 * time.Hour},
+		// applyDefaults rewrites 0 → default for these two, so the lower
+		// bound here matches what the user can actually realize via YAML
+		// (rather than the unreachable monitor.go disable sentinel of 0).
+		{"monitor.nocomm_threshold", c.Monitor.NoCommThreshold, time.Second, time.Hour},
+		{"monitor.replbatt_debounce", c.Monitor.ReplBattDebounce, time.Second, 24 * time.Hour},
 		{"monitor.reconnect_backoff", c.Monitor.ReconnectBackoff, 100 * time.Millisecond, time.Minute},
 		{"nut.timeout", c.NUT.Timeout, 100 * time.Millisecond, time.Minute},
 	} {
