@@ -43,33 +43,117 @@ notifications:
   #   BYPASS, NOTBYPASS, OVERLOAD, NOTOVERLOAD,
   #   TRIM, NOTTRIM, BOOST, NOTBOOST,
   #   CAL, NOTCAL, OFF, NOTOFF, ALARM, NOTALARM
+  #
+  # Templates use Go text/template against the TemplateData type. The big
+  # if/else chain on .Event is duplicated across notifiers because each
+  # field is its own template — keep them in sync if you add a new event.
 
   shell:
+    # journald-friendly log line, emoji-prefixed for fast visual scan in
+    # `journalctl -u ups-client -f`.
     - name: log
       command: /usr/bin/logger
-      args: ["-t", "ups-client", "{{.Event}} on {{.UPS}} status={{.Status}} charge={{.BatteryCharge}}%"]
+      args:
+        - "-t"
+        - "ups-client"
+        - >-
+          {{- if eq .Event "ONLINE" }}🟢
+          {{- else if eq .Event "ONBATT" }}🔌
+          {{- else if eq .Event "LOWBATT" }}🪫
+          {{- else if eq .Event "FSD" }}🛑
+          {{- else if eq .Event "REPLBATT" }}🔋
+          {{- else if eq .Event "COMMBAD" }}📡
+          {{- else if eq .Event "COMMOK" }}✅
+          {{- else if eq .Event "NOCOMM" }}🚨
+          {{- else if eq .Event "OVERLOAD" }}🔥
+          {{- else if eq .Event "BYPASS" }}⚡
+          {{- else if eq .Event "ALARM" }}⚠️
+          {{- else if eq .Event "STARTUP" }}🚀
+          {{- else }}⚙️
+          {{- end }} {{ .Event }} ups={{.UPS}} status="{{.Status}}" charge={{.BatteryCharge}}% runtime={{.BatteryRuntime}}s load={{.UPSLoad}}%
       timeout: 5s
 
-    # Trigger a graceful local shutdown on FSD or sustained low-battery.
+    # Graceful local shutdown when the UPS hits FSD.
     - name: shutdown
       command: /sbin/shutdown
-      args: ["-h", "+1", "UPS event {{.Event}}"]
+      args: ["-h", "+1", "🛑 UPS event {{.Event}} — initiating shutdown"]
       timeout: 5s
       events: [FSD]
 
   webhook:
     # ntfy.sh — see https://ntfy.sh/
+    # Severity-tiered: urgent for FSD/NOCOMM, high for low-battery and faults,
+    # default for transitions, low for routine recovery.
     - name: ntfy
-      url: https://ntfy.sh/my-ups-topic
+      url: https://ntfy.sh/your-private-topic
       headers:
-        Title: "UPS {{.UPS}} – {{.Event}}"
-        Priority: "high"
-        Tags: "warning,electric_plug"
-      body: "{{.Event}} on {{.UPS}} (status: {{.Status}}, charge: {{.BatteryCharge}}%, runtime: {{.BatteryRuntime}}s)"
-      timeout: 5s
-      events: [ONBATT, LOWBATT, FSD, ONLINE, COMMBAD, COMMOK]
+        Title: >-
+          {{- if eq .Event "ONLINE" }}🟢 UPS {{.UPS}} · back on mains
+          {{- else if eq .Event "ONBATT" }}🔌 UPS {{.UPS}} · running on battery
+          {{- else if eq .Event "LOWBATT" }}🪫 UPS {{.UPS}} · LOW BATTERY
+          {{- else if eq .Event "FSD" }}🛑 UPS {{.UPS}} · forced shutdown
+          {{- else if eq .Event "REPLBATT" }}🔋 UPS {{.UPS}} · replace battery
+          {{- else if eq .Event "COMMBAD" }}📡 UPS {{.UPS}} · communication lost
+          {{- else if eq .Event "COMMOK" }}✅ UPS {{.UPS}} · communication restored
+          {{- else if eq .Event "NOCOMM" }}🚨 UPS {{.UPS}} · UNREACHABLE
+          {{- else if eq .Event "OVERLOAD" }}🔥 UPS {{.UPS}} · OVERLOAD
+          {{- else if eq .Event "NOTOVERLOAD" }}✅ UPS {{.UPS}} · overload cleared
+          {{- else if eq .Event "BYPASS" }}⚡ UPS {{.UPS}} · bypass active
+          {{- else if eq .Event "NOTBYPASS" }}✅ UPS {{.UPS}} · bypass cleared
+          {{- else if eq .Event "ALARM" }}⚠️ UPS {{.UPS}} · alarm
+          {{- else if eq .Event "NOTALARM" }}✅ UPS {{.UPS}} · alarm cleared
+          {{- else if eq .Event "STARTUP" }}🚀 UPS {{.UPS}} · ups-client started
+          {{- else }}⚙️ UPS {{.UPS}} · {{.Event}}{{ end }}
+        Priority: >-
+          {{- if eq .Event "FSD" "NOCOMM" "OVERLOAD" }}urgent
+          {{- else if eq .Event "LOWBATT" "REPLBATT" "ALARM" "ONBATT" "COMMBAD" "BYPASS" "OFF" }}high
+          {{- else if eq .Event "STARTUP" }}low
+          {{- else }}default{{ end }}
+        Tags: >-
+          {{- if eq .Event "ONLINE" }}green_circle,electric_plug
+          {{- else if eq .Event "ONBATT" }}orange_circle,battery
+          {{- else if eq .Event "LOWBATT" }}rotating_light,low_battery
+          {{- else if eq .Event "FSD" }}rotating_light,zap
+          {{- else if eq .Event "REPLBATT" }}wrench,battery
+          {{- else if eq .Event "COMMBAD" }}satellite_antenna,warning
+          {{- else if eq .Event "COMMOK" }}satellite_antenna,white_check_mark
+          {{- else if eq .Event "NOCOMM" }}rotating_light,satellite_antenna
+          {{- else if eq .Event "OVERLOAD" }}fire,warning
+          {{- else if eq .Event "NOTOVERLOAD" }}white_check_mark
+          {{- else if eq .Event "BYPASS" }}high_voltage,warning
+          {{- else if eq .Event "NOTBYPASS" }}white_check_mark
+          {{- else if eq .Event "ALARM" }}warning,bell
+          {{- else if eq .Event "NOTALARM" }}white_check_mark,bell
+          {{- else if eq .Event "STARTUP" }}rocket
+          {{- else }}gear{{ end }}
+      body: |-
+        {{- if eq .Event "ONLINE" }}🟢 Mains power restored.
+        {{- else if eq .Event "ONBATT" }}🔌 Now running on battery.
+        {{- else if eq .Event "LOWBATT" }}🪫 Battery low — shutdown imminent.
+        {{- else if eq .Event "FSD" }}🛑 Forced shutdown in progress.
+        {{- else if eq .Event "REPLBATT" }}🔋 Battery health degraded — schedule replacement.
+        {{- else if eq .Event "COMMBAD" }}📡 Lost communication with the UPS driver.
+        {{- else if eq .Event "COMMOK" }}✅ Communication with the UPS restored.
+        {{- else if eq .Event "NOCOMM" }}🚨 UPS still unreachable past the comm-loss threshold.
+        {{- else if eq .Event "OVERLOAD" }}🔥 Output overload — shed load now.
+        {{- else if eq .Event "NOTOVERLOAD" }}✅ Overload condition cleared.
+        {{- else if eq .Event "BYPASS" }}⚡ UPS in bypass — load is unprotected.
+        {{- else if eq .Event "NOTBYPASS" }}✅ Bypass cleared — load is protected again.
+        {{- else if eq .Event "ALARM" }}⚠️ UPS reports an active alarm.
+        {{- else if eq .Event "NOTALARM" }}✅ UPS alarm cleared.
+        {{- else if eq .Event "STARTUP" }}🚀 ups-client connected and monitoring.
+        {{- else }}⚙️ {{ .Event }}{{ end }}
 
-    # Home Assistant generic webhook (default JSON body).
+        ────────────────────────────
+        🔋 Charge   {{ .BatteryCharge }}%
+        ⏱  Runtime  {{ .BatteryRuntime }}s
+        ⚖  Load     {{ .UPSLoad }}%
+        🔌 Mains    {{ .InputVoltage }}V
+        📊 Status   {{ .Status }}
+        🕒 At       {{ .Time.Format "2006-01-02 15:04:05 MST" }}
+      timeout: 5s
+
+    # Home Assistant generic webhook (default JSON body, no template).
     - name: home-assistant
       url: https://ha.example/api/webhook/ups-events
       timeout: 5s
@@ -82,17 +166,36 @@ notifications:
       private_key_file: /etc/ups-client/id_ed25519
       known_hosts_file: /etc/ups-client/known_hosts
       command: |
-        logger -t ups "{{.Event}} on {{.UPS}}: status={{.Status}} charge={{.BatteryCharge}}%"
-        if [ "{{.Event}}" = "ONBATT" ] || [ "{{.Event}}" = "LOWBATT" ]; then
-          systemctl stop heavy-job.service
-        fi
+        logger -t ups "🔔 {{.Event}} on {{.UPS}} status={{.Status}} charge={{.BatteryCharge}}%"
+        case "{{.Event}}" in
+          ONBATT|LOWBATT|FSD) systemctl stop heavy-job.service ;;
+          ONLINE)             systemctl start heavy-job.service ;;
+        esac
       timeout: 10s
       events: [ONBATT, LOWBATT, FSD, ONLINE]
 
   telegram:
+    # No parse_mode keeps the message tolerant of arbitrary characters in
+    # status strings; switch to HTML or MarkdownV2 only if you need rich
+    # formatting and accept the escaping headache.
     - name: ops
       bot_token: "123456:ABC-DEF"
       chat_id: "-1001234567890"
-      parse_mode: MarkdownV2
-      message: "*UPS {{.UPS}}*: `{{.Event}}` \\| status `{{.Status}}` \\| charge {{.BatteryCharge}}%"
+      message: |-
+        {{- if eq .Event "ONLINE" }}🟢 UPS {{.UPS}} — back on mains
+        {{- else if eq .Event "ONBATT" }}🔌 UPS {{.UPS}} — running on battery
+        {{- else if eq .Event "LOWBATT" }}🪫 UPS {{.UPS}} — LOW BATTERY
+        {{- else if eq .Event "FSD" }}🛑 UPS {{.UPS}} — forced shutdown imminent
+        {{- else if eq .Event "REPLBATT" }}🔋 UPS {{.UPS}} — replace battery soon
+        {{- else if eq .Event "COMMBAD" }}📡 UPS {{.UPS}} — communication lost
+        {{- else if eq .Event "COMMOK" }}✅ UPS {{.UPS}} — communication restored
+        {{- else if eq .Event "NOCOMM" }}🚨 UPS {{.UPS}} — UNREACHABLE
+        {{- else if eq .Event "OVERLOAD" }}🔥 UPS {{.UPS}} — overload
+        {{- else if eq .Event "BYPASS" }}⚡ UPS {{.UPS}} — bypass active
+        {{- else if eq .Event "ALARM" }}⚠️ UPS {{.UPS}} — alarm
+        {{- else if eq .Event "STARTUP" }}🚀 UPS {{.UPS}} — ups-client started
+        {{- else }}⚙️ UPS {{.UPS}} — {{.Event}}{{ end }}
+
+        🔋 {{.BatteryCharge}}%   ⏱ {{.BatteryRuntime}}s   ⚖ {{.UPSLoad}}%   🔌 {{.InputVoltage}}V
+        📊 {{.Status}}
       timeout: 5s
