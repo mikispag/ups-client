@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -84,7 +85,9 @@ func (t *TelegramTarget) Notify(ctx context.Context, e monitor.Event) error {
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(form.Encode()))
 	if err != nil {
-		return err
+		// url.Parse failures embed the full URL (with bot token) in the
+		// returned error — redact the same way as the Do() path below.
+		return fmt.Errorf("%s: %s", t.Name(), redactToken(err.Error(), t.BotToken))
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
@@ -113,13 +116,20 @@ func (t *TelegramTarget) Notify(ctx context.Context, e monitor.Event) error {
 	return nil
 }
 
-// redactToken replaces every occurrence of token in s with "***". A no-op
-// when token is empty.
+// redactToken replaces every occurrence of token in s with "***", in both
+// the raw form and the strconv.Quote-escaped form (because *url.Error
+// renders the URL via strconv.Quote, which escapes control bytes that
+// would otherwise be present verbatim in the token).
 func redactToken(s, token string) string {
 	if token == "" {
 		return s
 	}
-	return strings.ReplaceAll(s, token, "***")
+	s = strings.ReplaceAll(s, token, "***")
+	quoted := strings.TrimPrefix(strings.TrimSuffix(strconv.Quote(token), `"`), `"`)
+	if quoted != token {
+		s = strings.ReplaceAll(s, quoted, "***")
+	}
+	return s
 }
 
 func (t *TelegramTarget) httpClient() *http.Client {

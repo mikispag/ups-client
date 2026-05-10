@@ -116,6 +116,29 @@ func TestTelegramName(t *testing.T) {
 	}
 }
 
+func TestTelegramRedactsTokenInRequestParseError(t *testing.T) {
+	// A bot token containing a URL-invalid byte (e.g. \n from a YAML block
+	// scalar copy-paste) makes http.NewRequestWithContext fail with a
+	// *url.Error embedding the full URL. The error must not surface the
+	// raw token.
+	tt := &TelegramTarget{
+		BotToken: "TOKEN-WITH-\nNEWLINE",
+		ChatID:   "1",
+		APIBase:  "https://api.telegram.org",
+		Timeout:  100 * time.Millisecond,
+	}
+	err := tt.Notify(context.Background(), sampleEvent(monitor.EventOnline))
+	if err == nil {
+		t.Fatal("expected url.Parse error")
+	}
+	if strings.Contains(err.Error(), "TOKEN-WITH-") {
+		t.Errorf("bot token leaked into error: %v", err)
+	}
+	if !strings.Contains(err.Error(), "***") {
+		t.Errorf("expected redaction marker in %v", err)
+	}
+}
+
 func TestTelegramRedactsTokenInNetworkError(t *testing.T) {
 	// Point at a closed listener so http.Client.Do returns a *url.Error
 	// whose URL embeds the bot token.
