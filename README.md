@@ -458,7 +458,7 @@ Detected by diffing successive `ups.status` token sets:
 | `STARTUP` | First successful poll after the client launches |
 | `ONLINE` | `OL` token entered (mains restored) |
 | `ONBATT` | `OB` token entered (running on battery) |
-| `LOWBATT` | `LB` token entered |
+| `LOWBATT` | `LB` token entered **while `OB` is also present** (bare `LB` on `OL` is noise on APC BX-series and is suppressed) |
 | `FSD` | `FSD` token entered (forced shutdown) |
 | `REPLBATT` | `RB` token persists past `replbatt_debounce` |
 | `BYPASS` / `NOTBYPASS` | `BYPASS` token enter / leave |
@@ -520,6 +520,7 @@ Everything else (`Protect{KernelTunables,KernelModules,ControlGroups}`, `Restric
 | `nut: NUT error: ACCESS-DENIED` | The UPS section requires auth; add `username` + `password` to `nut:`. |
 | `nut: NUT error: UNKNOWN-UPS` | `nut.ups` doesn't match the section name in `ups.conf`. |
 | Spurious `REPLBATT` | APC BX firmware quirk. Raise `monitor.replbatt_debounce` past the default `600s`, or tighten the driver-side `lbrb_log_delay_sec` in `ups.conf`. See [Tuning the APC-BX flap mitigation](#tuning-the-apc-bx-flap-mitigation). |
+| Spurious `LOWBATT` while on mains | Should not happen any more: `LOWBATT` only fires when `LB` *and* `OB` are both set, since a bare `LB` on `OL` has no operational meaning (no shutdown is coming) and APC BX-series firmware asserts spurious `LB`+`RB` during background battery self-tests at full charge. If you genuinely want the bare-`LB` signal on `OL`, watch the `STARTUP`/`ONLINE` events instead and inspect `{{.Vars.ups_status}}` from a shell hook. |
 | `DATA-STALE` floods | The driver lost the device, or BX firmware returned a broken HID report length. Check `dmesg` for USB resets and make sure `maxreport = 1` is set in `ups.conf`. |
 
 ## Development

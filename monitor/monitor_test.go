@@ -141,6 +141,25 @@ func TestMonitorOnBattLowBattOnline(t *testing.T) {
 	}
 }
 
+func TestMonitorBareLBOnOLIsSuppressed(t *testing.T) {
+	// APC BX-series firmware spuriously asserts LB (and RB) during periodic
+	// battery self-tests at full charge while on mains. The status string
+	// looks like "OL LB RB". LOWBATT must NOT fire because there is no
+	// shutdown coming — we are still online — and the alert would be
+	// noise. ONBATT is also absent, so we know there's nothing real here.
+	m, rs, _ := newMonitorWithStatus(t,
+		"OL",
+		"OL LB RB", // firmware glitch
+		"OL",       // glitch clears
+	)
+	runFor(t, m, 3)
+	for _, e := range rs.events {
+		if e.Kind == EventLowBatt {
+			t.Errorf("LOWBATT must not fire for bare LB on OL; events: %v", rs.Kinds())
+		}
+	}
+}
+
 func TestMonitorReplBattDebounce(t *testing.T) {
 	// RB appears, then disappears within debounce window — must NOT emit.
 	fc := &fakeConn{statusSeq: []string{"OL", "OL RB", "OL"}, listVars: map[string]string{}}

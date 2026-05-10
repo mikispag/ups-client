@@ -361,8 +361,13 @@ func (m *Monitor) diffAndEmit(ctx context.Context, snap Snapshot, cur nut.Status
 		}
 	}
 
-	// LB: emit on first sighting, do not re-emit until LB clears.
-	if cur.Has("LB") && !prev.Has("LB") {
+	// LOWBATT only fires when LB AND OB are both set on the new status.
+	// A bare LB during OL has no operational meaning (no shutdown is
+	// coming — mains are good) and APC BX-series firmware spuriously
+	// asserts LB+RB during background battery self-tests at full charge.
+	// This matches upsmon's protected-shutdown semantics, where LB only
+	// triggers action while ONBATT.
+	if cur.Has("LB") && cur.Has("OB") && !(prev.Has("LB") && prev.Has("OB")) {
 		m.emit(ctx, Event{Kind: EventLowBatt, Snapshot: snap, Previous: m.last, Message: m.describe(EventLowBatt, snap)})
 	}
 
