@@ -229,15 +229,43 @@ CAL, NOTCAL, OFF, NOTOFF, ALARM, NOTALARM
 | `{{.DeviceModel}}` / `{{.DeviceSerial}}` | From `device.*` |
 | `{{.Vars}}` | Raw map of every NUT variable (use `{{index .Vars "ups.alarm"}}`) |
 
+> The bundled [`ups-client.example.yaml`](./ups-client.example.yaml) ships with **pretty, emoji-led message templates** wired up for every event — severity-tiered ntfy `Priority`/`Tags` (urgent for `FSD`/`NOCOMM`/`OVERLOAD`, high for `LOWBATT`/`REPLBATT`/`ALARM`/`ONBATT`/`COMMBAD`/`BYPASS`/`OFF`, default for transitions, low for `STARTUP`), a single `text/template` if/else chain on `.Event` per field, and a clean metric block. The snippets below show the pattern condensed; copy the full chains from the example file for production.
+
+Sample rendering (ntfy):
+
+```
+🟢 UPS ups · back on mains          🔌 UPS ups · running on battery
+🪫 UPS ups · LOW BATTERY            🛑 UPS ups · forced shutdown
+🔋 UPS ups · replace battery        🚨 UPS ups · UNREACHABLE
+🔥 UPS ups · OVERLOAD               ⚡ UPS ups · bypass active
+
+🔋 Charge   98%
+⏱  Runtime  3600s
+⚖  Load     12%
+🔌 Mains    230V
+📊 Status   OL CHRG
+🕒 At       2026-05-10 12:34:56 UTC
+```
+
 #### Shell
+
+Emoji-prefixed log line for fast visual scanning in `journalctl -u ups-client -f`:
 
 ```yaml
 shell:
   - name: log
     command: /usr/bin/logger
-    args: ["-t", "ups-client", "{{.Event}} on {{.UPS}} charge={{.BatteryCharge}}%"]
+    args:
+      - "-t"
+      - "ups-client"
+      - >-
+        {{- if eq .Event "ONLINE" }}🟢
+        {{- else if eq .Event "ONBATT" }}🔌
+        {{- else if eq .Event "LOWBATT" }}🪫
+        {{- else if eq .Event "FSD" }}🛑
+        {{- else }}⚙️
+        {{- end }} {{ .Event }} ups={{.UPS}} status="{{.Status}}" charge={{.BatteryCharge}}%
     timeout: 5s
-    events: [ONBATT, ONLINE, LOWBATT, FSD]
 ```
 
 The child process inherits your environment plus `UPS_*` variables: `UPS_EVENT`, `UPS_NAME`, `UPS_STATUS`, `UPS_PREVIOUS_STATUS`, `UPS_BATTERY_CHARGE`, `UPS_BATTERY_RUNTIME`, `UPS_INPUT_VOLTAGE`, `UPS_OUTPUT_VOLTAGE`, `UPS_LOAD`, `UPS_DEVICE_MODEL`, `UPS_DEVICE_SERIAL`, `UPS_TIMESTAMP`. The optional per-target `env:` map adds extra keys.
@@ -254,19 +282,38 @@ webhook:
 
 ##### ntfy ([ntfy.sh](https://ntfy.sh/))
 
-ntfy is a pub/sub HTTP notifier. Pick a topic (any string — keep it private since the topic is the only secret), then POST plain text with optional `Title`, `Priority`, `Tags` headers. The generic webhook handles this without a dedicated channel:
+ntfy is a pub/sub HTTP notifier. Pick a topic (any string — keep it private since the topic is the only secret), then POST plain text with optional `Title`, `Priority`, `Tags` headers. The generic webhook handles this without a dedicated channel. The full templates in [`ups-client.example.yaml`](./ups-client.example.yaml) tier the priority and tags by event severity; condensed pattern:
 
 ```yaml
 webhook:
   - name: ntfy
     url: https://ntfy.sh/my-private-topic    # or self-host: https://ntfy.example/...
     headers:
-      Title:    "UPS {{.UPS}} – {{.Event}}"
-      Priority: "high"                       # min, low, default, high, urgent
-      Tags:     "warning,electric_plug"      # comma-separated emoji shortcodes
-    body: "{{.Event}} on {{.UPS}} (status: {{.Status}}, charge: {{.BatteryCharge}}%, runtime: {{.BatteryRuntime}}s)"
+      Title: >-
+        {{- if eq .Event "ONLINE" }}🟢 UPS {{.UPS}} · back on mains
+        {{- else if eq .Event "ONBATT" }}🔌 UPS {{.UPS}} · running on battery
+        {{- else if eq .Event "LOWBATT" }}🪫 UPS {{.UPS}} · LOW BATTERY
+        {{- else if eq .Event "FSD" }}🛑 UPS {{.UPS}} · forced shutdown
+        {{- else }}⚙️ UPS {{.UPS}} · {{.Event}}{{ end }}
+      Priority: >-
+        {{- if eq .Event "FSD" "NOCOMM" "OVERLOAD" }}urgent
+        {{- else if eq .Event "LOWBATT" "REPLBATT" "ALARM" "ONBATT" "COMMBAD" }}high
+        {{- else if eq .Event "STARTUP" }}low
+        {{- else }}default{{ end }}
+      Tags: >-
+        {{- if eq .Event "ONLINE" }}green_circle,electric_plug
+        {{- else if eq .Event "ONBATT" }}orange_circle,battery
+        {{- else if eq .Event "LOWBATT" }}rotating_light,low_battery
+        {{- else }}gear{{ end }}
+    body: |-
+      {{- if eq .Event "ONLINE" }}🟢 Mains power restored.
+      {{- else if eq .Event "ONBATT" }}🔌 Now running on battery.
+      {{- else }}⚙️ {{ .Event }}{{ end }}
+
+      🔋 Charge   {{ .BatteryCharge }}%
+      ⏱  Runtime  {{ .BatteryRuntime }}s
+      ⚖  Load     {{ .UPSLoad }}%
     timeout: 5s
-    events: [ONBATT, LOWBATT, FSD, ONLINE, COMMBAD, COMMOK]
 ```
 
 Subscribe on your phone with the [ntfy app](https://ntfy.sh/) (`Subscribe to topic` → enter `my-private-topic`) or via `curl -s https://ntfy.sh/my-private-topic/sse`.
@@ -279,7 +326,7 @@ For self-hosted ntfy with auth, add a bearer token via headers:
       Title: "UPS {{.UPS}} – {{.Event}}"
 ```
 
-Reference: <https://ntfy.sh/docs/publish/>.
+ntfy emoji shortcode list: <https://docs.ntfy.sh/emojis/>. Reference: <https://ntfy.sh/docs/publish/>.
 
 #### SSH
 
@@ -296,8 +343,11 @@ ssh:
     known_hosts_file: /etc/ups-client/known_hosts
     # insecure_ignore_host_key: true  # NOT recommended
     command: |
-      logger -t ups "{{.Event}} on {{.UPS}}"
-      [ "{{.Event}}" = "ONBATT" ] && systemctl stop heavy-job.service
+      logger -t ups "🔔 {{.Event}} on {{.UPS}} status={{.Status}} charge={{.BatteryCharge}}%"
+      case "{{.Event}}" in
+        ONBATT|LOWBATT|FSD) systemctl stop heavy-job.service ;;
+        ONLINE)             systemctl start heavy-job.service ;;
+      esac
     timeout: 10s
     events: [ONBATT, LOWBATT, FSD, ONLINE]
 ```
@@ -306,15 +356,22 @@ Generate the trust pin once with `ssh-keyscan -H nas.lan >> /etc/ups-client/know
 
 #### Telegram
 
-Create a bot with [@BotFather](https://t.me/BotFather), grab the token, and look up your chat id (e.g. message [@RawDataBot](https://t.me/RawDataBot)).
+Create a bot with [@BotFather](https://t.me/BotFather), grab the token, and look up your chat id (e.g. message [@RawDataBot](https://t.me/RawDataBot)). Plain text (no `parse_mode`) keeps the message tolerant of arbitrary characters in `Status`; switch to `HTML` or `MarkdownV2` only if you need rich formatting and accept the escaping cost:
 
 ```yaml
 telegram:
   - name: ops
     bot_token: "123456:ABC-DEF..."
     chat_id: "-1001234567890"          # negative for groups/channels
-    parse_mode: MarkdownV2             # optional
-    message: "*UPS {{.UPS}}*: `{{.Event}}` \\| status `{{.Status}}` \\| charge {{.BatteryCharge}}%"
+    message: |-
+      {{- if eq .Event "ONLINE" }}🟢 UPS {{.UPS}} — back on mains
+      {{- else if eq .Event "ONBATT" }}🔌 UPS {{.UPS}} — running on battery
+      {{- else if eq .Event "LOWBATT" }}🪫 UPS {{.UPS}} — LOW BATTERY
+      {{- else if eq .Event "FSD" }}🛑 UPS {{.UPS}} — forced shutdown imminent
+      {{- else }}⚙️ UPS {{.UPS}} — {{.Event}}{{ end }}
+
+      🔋 {{.BatteryCharge}}%   ⏱ {{.BatteryRuntime}}s   ⚖ {{.UPSLoad}}%   🔌 {{.InputVoltage}}V
+      📊 {{.Status}}
     timeout: 5s
 ```
 
