@@ -154,7 +154,7 @@ func (c *Config) applyDefaults() {
 		c.Monitor.NoCommThreshold = 60 * time.Second
 	}
 	if c.Monitor.ReplBattDebounce == 0 {
-		c.Monitor.ReplBattDebounce = 30 * time.Second
+		c.Monitor.ReplBattDebounce = 600 * time.Second
 	}
 	if c.Monitor.ReconnectBackoff == 0 {
 		c.Monitor.ReconnectBackoff = time.Second

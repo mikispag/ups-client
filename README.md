@@ -159,7 +159,7 @@ monitor:
   status_interval: 2s        # ups.status polling cadence (>= 500ms)
   snapshot_interval: 30s     # bulk LIST VAR cadence
   nocomm_threshold: 60s      # COMMBAD ➜ NOCOMM after this much sustained loss
-  replbatt_debounce: 30s     # hold RB this long before emitting REPLBATT
+  replbatt_debounce: 600s    # hold RB this long before emitting REPLBATT
   reconnect_backoff: 1s      # initial backoff; doubles, caps at 30s
 ```
 
@@ -376,7 +376,7 @@ journalctl -u ups-client.service -f
 | `connect: dial tcp 127.0.0.1:3493: connect: connection refused` | `upsd` not running or not listening on 127.0.0.1; check `LISTEN` in `upsd.conf`. |
 | `nut: NUT error: ACCESS-DENIED` | The UPS section requires auth; add `username` + `password` to `nut:`. |
 | `nut: NUT error: UNKNOWN-UPS` | `nut.ups` doesn't match the section name in `ups.conf`. |
-| Spurious `REPLBATT` | APC BX firmware quirk. Increase `monitor.replbatt_debounce` (e.g. `120s`) or set `lbrb_log_delay_sec` in `ups.conf`. |
+| Spurious `REPLBATT` | APC BX firmware quirk. Increase `monitor.replbatt_debounce` past the default `600s` or set `lbrb_log_delay_sec` in `ups.conf`. |
 | `DATA-STALE` floods | The driver lost the device. Check `dmesg` for USB resets; consider `maxreport=1` in `ups.conf` for some BX firmware. |
 
 ## Development

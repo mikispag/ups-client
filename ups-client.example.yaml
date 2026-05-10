@@ -30,8 +30,8 @@ monitor:
   # Sustained communication-bad time after which NOCOMM fires. Set to 0 to disable.
   nocomm_threshold: 60s
   # Hold the RB token this long before emitting REPLBATT. APC BX-series
-  # firmwares are known to flap; 30s smooths that out.
-  replbatt_debounce: 30s
+  # firmwares are known to flap; 600s smooths that out.
+  replbatt_debounce: 600s
   # Initial reconnect backoff (caps at 30s).
   reconnect_backoff: 1s
 
