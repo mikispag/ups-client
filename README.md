@@ -131,10 +131,20 @@ The repo targets `go 1.23+`. No CGO.
 | `init/ups-client.sysusers` | `$(SYSCONFDIR)/sysusers.d/ups-client.conf` | `0644` |
 | `ups-client.example.yaml` | `$(SYSCONFDIR)/ups-client/config.example.yaml` | `0644` |
 
-Standard knobs: `PREFIX`, `DESTDIR`, `BINDIR`, `SYSCONFDIR`, `UNITDIR`, `SYSUSERSDIR`. Example for a Debian-style packager:
+Standard knobs: `PREFIX`, `DESTDIR`, `BINDIR`, `SYSCONFDIR`, `UNITDIR`, `SYSUSERSDIR`. The Makefile uses only POSIX-portable tools (`install`, `sed`, `chmod`, `printf`, `awk`), so the same `sudo make install` works on Debian/Ubuntu **and Arch Linux** — `/etc/systemd/system/` and `/etc/sysusers.d/` are valid admin-install paths on both.
+
+Per-distro tweaks for packagers:
 
 ```bash
-make install DESTDIR=$PWD/debian/ups-client PREFIX=/usr SYSCONFDIR=/etc
+# Debian/Ubuntu (.deb): system prefix is /usr, units live alongside the rest of the package
+make install DESTDIR=$PWD/debian/ups-client PREFIX=/usr SYSCONFDIR=/etc \
+             UNITDIR=/lib/systemd/system SYSUSERSDIR=/usr/lib/sysusers.d
+```
+
+```bash
+# Arch (PKGBUILD package() function): use /usr and /usr/lib/{systemd/system,sysusers.d}
+make install DESTDIR="$pkgdir" PREFIX=/usr SYSCONFDIR=/etc \
+             UNITDIR=/usr/lib/systemd/system SYSUSERSDIR=/usr/lib/sysusers.d
 ```
 
 `make install` runs as a normal user when staging into `DESTDIR`, and needs `sudo` for system-wide installs. After it finishes you'll get a printed checklist of the placeholder values that **must** be replaced before the service can start (ntfy URL, Telegram token/chat id, SSH host/key, etc.) — the service unit deliberately points at `config.yaml`, not `config.example.yaml`, so the daemon refuses to start until you make a copy and edit it.
