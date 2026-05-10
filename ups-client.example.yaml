@@ -1,0 +1,98 @@
+# ups-client example configuration.
+#
+# Copy to /etc/ups-client/config.yaml and edit. All durations accept Go's
+# time.ParseDuration syntax (e.g. 2s, 500ms, 1m).
+
+nut:
+  # host:port of upsd. Default port is 3493.
+  address: 127.0.0.1:3493
+  # The UPS section name as configured in /etc/nut/ups.conf (e.g. [myups] -> "myups").
+  ups: ups
+  # Authentication is only required for SET/INSTCMD/PRIMARY. For read-only
+  # monitoring against a default upsd, leave both empty.
+  username: ""
+  password: ""
+  # Per-request read/write deadline.
+  timeout: 5s
+  # tls:
+  #   enable: true
+  #   ca_file: /etc/ssl/upsd-ca.pem
+  #   server_name: upsd.example
+  #   insecure_skip_verify: false
+
+monitor:
+  # ups.status polling cadence. Match upsd's pollinterval (default 2s) or go
+  # slightly slower; do not go below 500ms.
+  status_interval: 2s
+  # Bulk LIST VAR refresh cadence. Used to keep snapshot metadata
+  # (battery.charge, runtime, load, etc.) fresh.
+  snapshot_interval: 30s
+  # Sustained communication-bad time after which NOCOMM fires. Set to 0 to disable.
+  nocomm_threshold: 60s
+  # Hold the RB token this long before emitting REPLBATT. APC BX-series
+  # firmwares are known to flap; 30s smooths that out.
+  replbatt_debounce: 30s
+  # Initial reconnect backoff (caps at 30s).
+  reconnect_backoff: 1s
+
+notifications:
+  # Each entry can include an optional `events:` list. Empty == every event.
+  # Available events:
+  #   STARTUP, ONLINE, ONBATT, LOWBATT, FSD, REPLBATT,
+  #   COMMBAD, COMMOK, NOCOMM,
+  #   BYPASS, NOTBYPASS, OVERLOAD, NOTOVERLOAD,
+  #   TRIM, NOTTRIM, BOOST, NOTBOOST,
+  #   CAL, NOTCAL, OFF, NOTOFF, ALARM, NOTALARM
+
+  shell:
+    - name: log
+      command: /usr/bin/logger
+      args: ["-t", "ups-client", "{{.Event}} on {{.UPS}} status={{.Status}} charge={{.BatteryCharge}}%"]
+      timeout: 5s
+
+    # Trigger a graceful local shutdown on FSD or sustained low-battery.
+    - name: shutdown
+      command: /sbin/shutdown
+      args: ["-h", "+1", "UPS event {{.Event}}"]
+      timeout: 5s
+      events: [FSD]
+
+  webhook:
+    # ntfy.sh — see https://ntfy.sh/
+    - name: ntfy
+      url: https://ntfy.sh/my-ups-topic
+      headers:
+        Title: "UPS {{.UPS}} – {{.Event}}"
+        Priority: "high"
+        Tags: "warning,electric_plug"
+      body: "{{.Event}} on {{.UPS}} (status: {{.Status}}, charge: {{.BatteryCharge}}%, runtime: {{.BatteryRuntime}}s)"
+      timeout: 5s
+      events: [ONBATT, LOWBATT, FSD, ONLINE, COMMBAD, COMMOK]
+
+    # Home Assistant generic webhook (default JSON body).
+    - name: home-assistant
+      url: https://ha.example/api/webhook/ups-events
+      timeout: 5s
+
+  ssh:
+    - name: nas
+      host: nas.lan
+      port: 22
+      user: ops
+      private_key_file: /etc/ups-client/id_ed25519
+      known_hosts_file: /etc/ups-client/known_hosts
+      command: |
+        logger -t ups "{{.Event}} on {{.UPS}}: status={{.Status}} charge={{.BatteryCharge}}%"
+        if [ "{{.Event}}" = "ONBATT" ] || [ "{{.Event}}" = "LOWBATT" ]; then
+          systemctl stop heavy-job.service
+        fi
+      timeout: 10s
+      events: [ONBATT, LOWBATT, FSD, ONLINE]
+
+  telegram:
+    - name: ops
+      bot_token: "123456:ABC-DEF"
+      chat_id: "-1001234567890"
+      parse_mode: MarkdownV2
+      message: "*UPS {{.UPS}}*: `{{.Event}}` \\| status `{{.Status}}` \\| charge {{.BatteryCharge}}%"
+      timeout: 5s
