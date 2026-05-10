@@ -1,0 +1,4 @@
+# systemd-sysusers configuration for the ups-client service.
+# Installed as /etc/sysusers.d/ups-client.conf; apply with `systemd-sysusers`.
+# Field order: type name id gecos home shell.
+u ups-client - "ups-client service" -

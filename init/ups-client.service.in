@@ -1,0 +1,23 @@
+[Unit]
+Description=UPS event client
+Documentation=https://github.com/mikispag/ups-client
+After=nut-server.service network-online.target
+Wants=network-online.target
+Requires=nut-server.service
+
+[Service]
+Type=simple
+User=ups-client
+Group=ups-client
+ExecStart=@BINDIR@/ups-client -config /etc/ups-client/config.yaml
+Restart=on-failure
+RestartSec=5s
+
+# Minimal, useful hardening — drops privilege, RO rootfs, no /home, own /tmp.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

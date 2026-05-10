@@ -101,7 +101,8 @@ A `Makefile` wraps the common workflows:
 
 ```bash
 make build       # → ./bin/ups-client (trimpath, stripped)
-make install     # → $GOBIN/ups-client
+make install     # binary + systemd unit + sysusers snippet + example config
+make uninstall   # reverse of install (keeps your config.yaml + the user)
 make test        # plain unit tests
 make test-race   # with the race detector
 make cover       # writes coverage.out and prints the total
@@ -119,6 +120,23 @@ go build -trimpath -o ups-client .
 ```
 
 The repo targets `go 1.23+`. No CGO.
+
+### `make install` layout
+
+| Source in repo | Installed to | Mode |
+|---|---|---|
+| `bin/ups-client` | `$(PREFIX)/bin/ups-client` (default `/usr/local/bin`) | `0755` |
+| `init/ups-client.service.in` | `$(SYSCONFDIR)/systemd/system/ups-client.service` (`@BINDIR@` → `$(PREFIX)/bin`) | `0644` |
+| `init/ups-client.sysusers` | `$(SYSCONFDIR)/sysusers.d/ups-client.conf` | `0644` |
+| `ups-client.example.yaml` | `$(SYSCONFDIR)/ups-client/config.example.yaml` | `0644` |
+
+Standard knobs: `PREFIX`, `DESTDIR`, `BINDIR`, `SYSCONFDIR`, `UNITDIR`, `SYSUSERSDIR`. Example for a Debian-style packager:
+
+```bash
+make install DESTDIR=$PWD/debian/ups-client PREFIX=/usr SYSCONFDIR=/etc
+```
+
+`make install` runs as a normal user when staging into `DESTDIR`, and needs `sudo` for system-wide installs. After it finishes you'll get a printed checklist of the placeholder values that **must** be replaced before the service can start (ntfy URL, Telegram token/chat id, SSH host/key, etc.) — the service unit deliberately points at `config.yaml`, not `config.example.yaml`, so the daemon refuses to start until you make a copy and edit it.
 
 ## Run
 
@@ -326,65 +344,45 @@ Detected by diffing successive `ups.status` token sets:
 | `COMMOK` | recovery from `COMMBAD` |
 | `NOCOMM` | sustained `COMMBAD` past `nocomm_threshold` |
 
-## systemd unit
+## Running as a service
 
-The service runs as a dedicated, unprivileged system user `ups-client`. systemd does **not** create the account on its own — you have to set it up once, either manually or declaratively via `systemd-sysusers`.
+The service runs as a dedicated, unprivileged system user `ups-client`. systemd does **not** create the account on its own — `make install` lays down the [`init/ups-client.sysusers`](./init/ups-client.sysusers) snippet for you to apply with `systemd-sysusers`.
 
-### 1. Create the system user
+The repo ships everything you need:
 
-Use `systemd-sysusers` so the account is declared in a config file and re-created automatically after reinstalls:
+| File | Purpose |
+|---|---|
+| [`init/ups-client.service.in`](./init/ups-client.service.in) | systemd unit (with `@BINDIR@` substituted at install time) |
+| [`init/ups-client.sysusers`](./init/ups-client.sysusers) | declarative `ups-client` system user for `systemd-sysusers` |
+| [`ups-client.example.yaml`](./ups-client.example.yaml) | annotated example configuration |
 
-```bash
-sudo tee /etc/sysusers.d/ups-client.conf >/dev/null <<'EOF'
-u ups-client - "ups-client service" -
-EOF
-sudo systemd-sysusers
-```
-
-The four fields are *type, name, id, gecos*. `u` provisions a system user and a matching group, `-` for id lets systemd allocate a free system UID, and the gecos string is what shows up in `getent passwd`. See `sysusers.d(5)`.
-
-Then make sure the config (and any SSH key file referenced from it) is readable by that user:
+End-to-end install:
 
 ```bash
-sudo install -d -o root -g ups-client -m 0750 /etc/ups-client
-sudo install -o root -g ups-client -m 0640 ups-client.example.yaml /etc/ups-client/config.yaml
-# If you use the SSH notifier:
-sudo install -o root -g ups-client -m 0640 /path/to/id_ed25519 /etc/ups-client/id_ed25519
-```
-
-### 2. Install the unit
-
-```ini
-# /etc/systemd/system/ups-client.service
-[Unit]
-Description=UPS event client
-After=nut-server.service network-online.target
-Wants=network-online.target
-Requires=nut-server.service
-
-[Service]
-Type=simple
-User=ups-client
-Group=ups-client
-ExecStart=/usr/local/bin/ups-client -config /etc/ups-client/config.yaml
-Restart=on-failure
-RestartSec=5s
-
-# Minimal, useful hardening — drops privilege, RO rootfs, no /home, own /tmp.
-NoNewPrivileges=yes
-ProtectSystem=strict
-ProtectHome=yes
-PrivateTmp=yes
-
-[Install]
-WantedBy=multi-user.target
-```
-
-```bash
+sudo make install                                            # places binary, unit, sysusers snippet, example config
+sudo systemd-sysusers                                        # creates the ups-client user/group from the snippet
+sudo cp /etc/ups-client/config.example.yaml /etc/ups-client/config.yaml
+sudo chown root:ups-client /etc/ups-client/config.yaml
+sudo chmod 0640 /etc/ups-client/config.yaml
+sudo "$EDITOR" /etc/ups-client/config.yaml                   # replace the placeholders!
+sudo /usr/local/bin/ups-client -check -config /etc/ups-client/config.yaml
 sudo systemctl daemon-reload
 sudo systemctl enable --now ups-client.service
 journalctl -u ups-client.service -f
 ```
+
+`make install` prints a detailed post-install checklist enumerating every placeholder value you must edit before the service can start (ntfy URL, Telegram bot token & chat id, SSH host / user / key path, …). The unit deliberately points at `config.yaml`, not `config.example.yaml`, so the daemon refuses to start until you make the copy.
+
+The unit's hardening is intentionally minimal — only the four directives that do real work for this daemon:
+
+```ini
+NoNewPrivileges=yes      # block setuid escalation
+ProtectSystem=strict     # read-only rootfs (incl. /etc, /usr)
+ProtectHome=yes          # no access to /home, /root
+PrivateTmp=yes           # private /tmp namespace
+```
+
+Everything else (`Protect{KernelTunables,KernelModules,ControlGroups}`, `Restrict{Namespaces,Realtime}`, `LockPersonality`, `SystemCallFilter`) is omitted on purpose — those directives only block syscalls this daemon never makes.
 
 ## Troubleshooting
 
