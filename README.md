@@ -315,20 +315,16 @@ The service runs as a dedicated, unprivileged system user `ups-client`. systemd 
 
 ### 1. Create the system user
 
-Pick one of:
+Use `systemd-sysusers` so the account is declared in a config file and re-created automatically after reinstalls:
 
 ```bash
-# Imperative (Debian/Ubuntu/Arch)
-sudo useradd --system --no-create-home --shell /usr/sbin/nologin ups-client
-```
-
-```bash
-# Declarative — recommended; survives package reinstalls
 sudo tee /etc/sysusers.d/ups-client.conf >/dev/null <<'EOF'
 u ups-client - "ups-client service" -
 EOF
 sudo systemd-sysusers
 ```
+
+The four fields are *type, name, id, gecos*. `u` provisions a system user and a matching group, `-` for id lets systemd allocate a free system UID, and the gecos string is what shows up in `getent passwd`. See `sysusers.d(5)`.
 
 Then make sure the config (and any SSH key file referenced from it) is readable by that user:
 
