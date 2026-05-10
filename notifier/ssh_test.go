@@ -181,6 +181,35 @@ func (b *blockingSSHSession) CombinedOutput(string) ([]byte, error) {
 }
 func (b *blockingSSHSession) Close() error { return nil }
 
+func TestSSHTargetContextCancelDuringDial(t *testing.T) {
+	// Regression for the handshake-stall: if dial hangs and ctx is
+	// cancelled, Notify must return ctx.Err() promptly via the outer
+	// select rather than block until dial returns. This models
+	// ssh.NewClientConn reading the SSH banner from a stalled peer.
+	keyPath := writeTempKey(t)
+	block := make(chan struct{})
+	defer close(block)
+	tt := &SSHTarget{
+		Host: "h", User: "u", Command: "x",
+		PrivateKeyFile: keyPath, InsecureIgnoreHostKey: true,
+		dial: func(_ context.Context, _, _ string, _ *ssh.ClientConfig) (sshClient, error) {
+			<-block // intentionally ignore ctx — simulate a hung NewClientConn
+			return nil, errors.New("unreachable")
+		},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { time.Sleep(20 * time.Millisecond); cancel() }()
+
+	start := time.Now()
+	err := tt.Notify(ctx, sampleEvent(monitor.EventOnline))
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Errorf("Notify took %s — outer select on ctx.Done not firing", elapsed)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("expected context.Canceled, got %v", err)
+	}
+}
+
 func TestSSHTargetMissingFields(t *testing.T) {
 	tt := &SSHTarget{}
 	if err := tt.Notify(context.Background(), sampleEvent(monitor.EventOnline)); err == nil {

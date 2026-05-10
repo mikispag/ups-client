@@ -169,11 +169,25 @@ func (t *SSHTarget) Notify(ctx context.Context, e monitor.Event) error {
 			if err != nil {
 				return nil, err
 			}
+			// `cfg.Timeout` only bounds the TCP leg per the x/crypto/ssh
+			// docs. Mirror what `ssh.Dial` does internally and bound the
+			// handshake with a read deadline so a peer that accepts TCP
+			// but stalls on the SSH banner cannot wedge us indefinitely.
+			if cfg.Timeout > 0 {
+				_ = nconn.SetReadDeadline(time.Now().Add(cfg.Timeout))
+			}
+			// Cancel the handshake on ctx cancel by closing the underlying
+			// TCP socket — `ssh.NewClientConn` does not accept a context.
+			stop := context.AfterFunc(ctx, func() { _ = nconn.Close() })
 			cliConn, chans, reqs, err := ssh.NewClientConn(nconn, addr, cfg)
+			stop()
 			if err != nil {
 				_ = nconn.Close()
 				return nil, err
 			}
+			// Clear the read deadline so the session is not truncated
+			// mid-command.
+			_ = nconn.SetReadDeadline(time.Time{})
 			return realSSHClient{c: ssh.NewClient(cliConn, chans, reqs)}, nil
 		}
 	}
@@ -213,12 +227,18 @@ func (t *SSHTarget) Notify(ctx context.Context, e monitor.Event) error {
 		ch <- result{out, runErr}
 	}()
 
-	r := <-ch
-	if r.err != nil {
-		if ctx.Err() != nil {
-			return ctx.Err()
+	// Outer select belts-and-suspenders the in-goroutine ctx wiring: if a
+	// fake dial or a buggy net stack ignores ctx, we still return
+	// promptly. The goroutine eventually finishes on its own once the
+	// OS-level timeout fires; the AfterFunc + read deadline above keep
+	// that bounded.
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case r := <-ch:
+		if r.err != nil {
+			return fmt.Errorf("%s: %w (output: %s)", t.Name(), r.err, string(r.out))
 		}
-		return fmt.Errorf("%s: %w (output: %s)", t.Name(), r.err, string(r.out))
+		return nil
 	}
-	return nil
 }
