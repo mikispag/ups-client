@@ -23,7 +23,8 @@ INST_SYSUSER := $(DESTDIR)$(SYSUSERSDIR)
 .PHONY: all build install install-bin install-config install-systemd uninstall \
         test test-race cover vet check tidy clean help
 
-all: build
+## all: housekeeping pass — tidy + vet + race tests + build (the default)
+all: tidy vet test-race build
 
 ## build: compile the static binary into ./bin/$(BINARY)
 build:

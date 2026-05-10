@@ -100,6 +100,7 @@ Verify with `upsc ups@localhost` (if you installed `nut-client`) or with `ups-cl
 A `Makefile` wraps the common workflows:
 
 ```bash
+make             # housekeeping pass: tidy + vet + race tests + build
 make build       # → ./bin/ups-client (trimpath, stripped)
 make install     # binary + systemd unit + sysusers snippet + example config
 make uninstall   # reverse of install (keeps your config.yaml + the user)
