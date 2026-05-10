@@ -1,30 +1,104 @@
 # ups-client
 
-A minimal, dependency-light Go client that tails a [Network UPS Tools (NUT)](https://networkupstools.org/) `upsd` instance and fans state-change events out to one or more notification channels: shell command, generic HTTP webhook (works great with [ntfy.sh](https://ntfy.sh/)), remote command over SSH, and Telegram bot.
+> 🔌 Pretty UPS event notifications — straight to your phone or chat — without [`upsmon`](https://networkupstools.org/docs/man/upsmon.html), without per-event shell scripts, without a custom shellout for every channel.
 
-It speaks the NUT TCP protocol directly — it does **not** shell out to `upsc` / `upsmon`. The NUT USB driver (`usbhid-ups` for APC) still does the actual hardware work and exposes data through `upsd`; this client just talks to `upsd`.
+[![CI](https://github.com/mikispag/ups-client/actions/workflows/ci.yml/badge.svg)](https://github.com/mikispag/ups-client/actions/workflows/ci.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/mikispag/ups-client.svg)](https://pkg.go.dev/github.com/mikispag/ups-client)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 
-Built for an APC Back-UPS BX2200MI on Linux, but the protocol layer is generic and works with any NUT-supported UPS.
+A single static Go binary that watches your UPS via [Network UPS Tools (NUT)](https://networkupstools.org/) and fans every state-change event out to whichever channels you wire up:
+
+- 📱 **[ntfy.sh](https://ntfy.sh/)** — emoji-titled phone push with severity-tiered priority and tags
+- 💬 **Telegram** — rich messages to a bot + chat
+- 🐚 **Shell** — any local command, with `UPS_*` env vars (e.g. `shutdown -h +1` on `FSD`)
+- 🔐 **SSH** — kick a remote command (stop a NAS job, page a server)
+- 🔗 **Generic webhook** — Home Assistant, Slack, Discord, Mattermost, …
+
+When the mains drop you get this on your phone, with a single ntfy buzz:
+
+```
+🔌 UPS ups · running on battery        (priority: high   · tags: orange_circle, battery)
+
+🔌 Now running on battery.
+
+────────────────────────────
+🔋 Charge   98%
+⏱  Runtime  3600s
+⚖  Load     12%
+🔌 Mains    230V
+📊 Status   OB DISCHRG
+🕒 At       2026-05-10 12:34:56 UTC
+```
+
+When it's almost out, an *urgent* push punches through Do Not Disturb:
+
+```
+🪫 UPS ups · LOW BATTERY              (priority: high   · tags: rotating_light, low_battery)
+🛑 UPS ups · forced shutdown           (priority: urgent · tags: rotating_light, zap)
+```
+
+## Why not just upsmon?
+
+`upsmon` ships with NUT, runs a single `NOTIFYCMD` shellout per event, and leaves you to write a wrapper that handles ntfy, Telegram, SSH, retries, templating, and APC firmware quirks. `ups-client` does that wrapper job natively:
+
+- **Multi-channel out of the box** — every event fans out to ntfy + Telegram + SSH + shell + webhook in parallel, each with its own event filter and `text/template`-rendered body.
+- **Severity-tiered notifications** — `FSD`/`NOCOMM`/`OVERLOAD` are urgent, `LOWBATT`/`REPLBATT`/`ALARM`/`ONBATT`/`COMMBAD` are high, transitions are default, `STARTUP` is low. No more single-pitch alerts that trains you to ignore them.
+- **No surprise pages from APC firmware** — the BX-series `RB`-token flap is debounced client-side (default 600s) on top of the driver knobs `lbrb_log_delay_sec` + `maxreport=1`. See [Tuning the APC-BX flap mitigation](#tuning-the-apc-bx-flap-mitigation).
+- **No CGO, no system Python, no helper shell** — single static Go binary (~8 MB), hardened systemd unit + sysusers snippet ship in the repo.
+- **Built for an APC Back-UPS BX2200MI**, generic for any NUT-supported UPS.
+
+## Quick start
+
+```bash
+# 1. Install NUT (see below for distro-specific commands), then:
+git clone https://github.com/mikispag/ups-client && cd ups-client
+sudo make install                                       # binary, unit, sysusers, example config
+sudo systemd-sysusers                                   # creates the ups-client user
+sudo cp /etc/ups-client/config.example.yaml /etc/ups-client/config.yaml
+sudo $EDITOR /etc/ups-client/config.yaml                # plug in your ntfy topic, Telegram token, …
+sudo /usr/local/bin/ups-client -check -config /etc/ups-client/config.yaml
+sudo systemctl enable --now ups-client.service
+journalctl -u ups-client -f
+```
+
+You'll get an emoji-titled push the next time the mains flicker.
 
 ## Features
 
-- Single static binary, no runtime deps beyond `upsd`.
-- upsmon-equivalent event detection: `ONLINE`, `ONBATT`, `LOWBATT`, `FSD`, `REPLBATT`, `COMMBAD`, `COMMOK`, `NOCOMM`, `BYPASS`/`NOTBYPASS`, `OVERLOAD`/`NOTOVERLOAD`, `TRIM`/`NOTTRIM`, `BOOST`/`NOTBOOST`, `CAL`/`NOTCAL`, `OFF`/`NOTOFF`, `ALARM`/`NOTALARM`, `STARTUP`.
-- Four notification channels with per-target event filtering and `text/template` rendering.
-- Automatic reconnect with exponential backoff; transient `DATA-STALE` / `DRIVER-NOT-CONNECTED` are handled as comm-bad events without crashing.
-- Optional `STARTTLS` for credentialed/remote `upsd` setups.
-- APC BX-series firmware quirks accounted for (configurable debounce on the `RB` flap).
+- **Wire-protocol native** — speaks NUT TCP directly to `upsd`; no shellouts to `upsc`/`upsmon`.
+- **upsmon-equivalent events** — `ONLINE`, `ONBATT`, `LOWBATT`, `FSD`, `REPLBATT`, `COMMBAD`, `COMMOK`, `NOCOMM`, plus enter/leave edges for `BYPASS`, `OVERLOAD`, `TRIM`, `BOOST`, `CAL`, `OFF`, `ALARM`, and a `STARTUP` ping.
+- **Auto-reconnect with backoff** — transient `DATA-STALE` / `DRIVER-NOT-CONNECTED` surface as `COMMBAD`/`COMMOK` rather than crashing the daemon.
+- **Per-target event filters** plus `text/template` rendering on every body, header, arg.
+- **Optional `STARTTLS`** for credentialed or remote `upsd` setups.
+- **Hardened systemd unit + dedicated user**, set up by `make install`.
 
-## Architecture
+## How it works
 
 ```
-NUT USB driver (usbhid-ups) ── /var/run/nut/...
-                                     │
-                                     ▼
-                                   upsd  ◄────── ups-client (this) ──► shell / webhook / ssh / telegram
+  ┌─────────────────────┐    USB
+  │  APC BX2200MI / …   │ ◀────────┐
+  └─────────────────────┘          │
+                                   │
+                       ┌───────────┴────────────┐
+                       │ usbhid-ups (NUT driver)│
+                       └───────────┬────────────┘
+                                   │ shared mem
+                                   ▼
+                              ┌─────────┐
+                              │  upsd   │  127.0.0.1:3493 (TCP)
+                              └────┬────┘
+                                   │ NUT protocol
+                                   ▼
+                            ┌─────────────┐
+                            │ ups-client  │
+                            └──────┬──────┘
+              ┌────────┬───────────┼───────────┬────────┐
+              ▼        ▼           ▼           ▼        ▼
+            shell    webhook     ntfy        ssh     telegram
+                    (HA, …)
 ```
 
-`ups-client` connects to `upsd` over TCP (default `127.0.0.1:3493`), polls `ups.status`, diffs the token set against the previous reading, and dispatches one event per token edge to every notifier whose event filter matches.
+`ups-client` keeps a long-lived TCP connection to `upsd`, polls `ups.status` every 2 s (matching `upsd`'s `pollinterval`), diffs the token set against the previous reading, and dispatches one event per token edge to every notifier whose event filter matches — all in parallel.
 
 ## Prerequisites: install the NUT USB drivers
 
