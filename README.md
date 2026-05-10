@@ -54,8 +54,13 @@ sudo pacman -S nut
     driver = usbhid-ups
     port = auto
     desc = "APC Back-UPS BX2200MI"
-    # If you see frequent LB/RB flapping in syslog, the BX firmware is the
-    # culprit; this driver-side knob suppresses spurious transitions:
+    # APC BX firmware misreports HID report lengths if the driver reads
+    # several reports in one pass. Reading one at a time avoids DATA-STALE
+    # storms and the spurious LB/RB tokens that come with them.
+    maxreport = 1
+    # Driver-side debounce of LB/RB transitions. 3s suppresses the very
+    # short flaps; the client-side replbatt_debounce (600s) catches the
+    # longer ones.
     lbrb_log_delay_sec = 3
 ```
 
@@ -164,6 +169,18 @@ monitor:
 ```
 
 `status_interval=2s` matches `upsd`'s default `pollinterval`. Going lower wastes CPU and risks `DATA-STALE`.
+
+### Tuning the APC-BX flap mitigation
+
+Three knobs at three layers — sane defaults for a BX2200MI in parentheses:
+
+| Layer | Knob | Default | What it does |
+|---|---|---|---|
+| `usbhid-ups` driver (`ups.conf`) | `maxreport` | **`1`** | Read one HID report per polling pass. Avoids broken-length reads that surface as `DATA-STALE` and ghost `LB`/`RB` tokens. |
+| `usbhid-ups` driver (`ups.conf`) | `lbrb_log_delay_sec` | **`3`** | Suppress LB/RB transitions shorter than this. Catches sub-second blips. |
+| `ups-client` (`config.yaml`) | `monitor.replbatt_debounce` | **`600s`** | Only emit `REPLBATT` after the `RB` token has held continuously this long. Catches slow flaps the driver lets through. |
+
+If you keep getting spurious `REPLBATT`, raise `replbatt_debounce` first; the driver-side knobs only need attention if you also see `DATA-STALE` or ghost `LOWBATT`s.
 
 ### `notifications`
 
@@ -376,8 +393,8 @@ journalctl -u ups-client.service -f
 | `connect: dial tcp 127.0.0.1:3493: connect: connection refused` | `upsd` not running or not listening on 127.0.0.1; check `LISTEN` in `upsd.conf`. |
 | `nut: NUT error: ACCESS-DENIED` | The UPS section requires auth; add `username` + `password` to `nut:`. |
 | `nut: NUT error: UNKNOWN-UPS` | `nut.ups` doesn't match the section name in `ups.conf`. |
-| Spurious `REPLBATT` | APC BX firmware quirk. Increase `monitor.replbatt_debounce` past the default `600s` or set `lbrb_log_delay_sec` in `ups.conf`. |
-| `DATA-STALE` floods | The driver lost the device. Check `dmesg` for USB resets; consider `maxreport=1` in `ups.conf` for some BX firmware. |
+| Spurious `REPLBATT` | APC BX firmware quirk. Raise `monitor.replbatt_debounce` past the default `600s`, or tighten the driver-side `lbrb_log_delay_sec` in `ups.conf`. See [Tuning the APC-BX flap mitigation](#tuning-the-apc-bx-flap-mitigation). |
+| `DATA-STALE` floods | The driver lost the device, or BX firmware returned a broken HID report length. Check `dmesg` for USB resets and make sure `maxreport = 1` is set in `ups.conf`. |
 
 ## Development
 
