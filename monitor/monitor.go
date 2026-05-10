@@ -258,6 +258,11 @@ func (m *Monitor) tryConnect(ctx context.Context) error {
 	// reconnection.
 	if m.commBad {
 		m.emit(ctx, Event{Kind: EventCommOK, Snapshot: snap, Previous: m.last, Message: "communication restored"})
+		// Don't carry RB-debounce state across an outage: we couldn't
+		// observe the token during it, so any post-reconnect RB needs a
+		// fresh debounce window.
+		m.rbFirstSeen = time.Time{}
+		m.rbConfirmed = false
 	}
 
 	if !m.started {

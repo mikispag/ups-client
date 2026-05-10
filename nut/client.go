@@ -154,14 +154,18 @@ func (c *Client) command(cmd string) (string, error) {
 // skip; read-only LIST/GET on a default upsd does not require auth. ups may
 // be empty to skip the LOGIN step (only relevant for upsmon-style primary
 // claims and SET/INSTCMD operations).
+//
+// Username and password are NUT-quoted on the wire so spaces or quote
+// characters in either are passed through as a single token rather than
+// frame-shifting the parser.
 func (c *Client) Login(username, password, ups string) error {
 	if username == "" && password == "" {
 		return nil
 	}
-	if _, err := c.command("USERNAME " + username); err != nil {
+	if _, err := c.command("USERNAME " + Quote(username)); err != nil {
 		return err
 	}
-	if _, err := c.command("PASSWORD " + password); err != nil {
+	if _, err := c.command("PASSWORD " + Quote(password)); err != nil {
 		return err
 	}
 	if ups != "" {
@@ -244,8 +248,7 @@ func (c *Client) ListUPS() (map[string]string, error) {
 			return nil
 		}
 		name := rest[:sp]
-		desc, _ := unquote(strings.TrimSpace(rest[sp+1:]))
-		out[name] = desc
+		out[name] = unquote(strings.TrimSpace(rest[sp+1:]))
 		return nil
 	})
 	if err != nil {
@@ -343,18 +346,18 @@ func parseVarLine(line string) (Var, error) {
 		return Var{}, fmt.Errorf("nut: malformed VAR line: %q", line)
 	}
 	name := rest[:sp2]
-	val, err := unquote(strings.TrimSpace(rest[sp2+1:]))
-	if err != nil {
-		return Var{}, err
-	}
-	return Var{UPS: ups, Name: name, Value: val}, nil
+	return Var{UPS: ups, Name: name, Value: unquote(strings.TrimSpace(rest[sp2+1:]))}, nil
 }
 
 // unquote parses a NUT-quoted token: surrounding `"` and `\\`/`\"` escapes.
-// An unquoted bareword is returned verbatim.
-func unquote(s string) (string, error) {
+// An unquoted bareword is returned verbatim. A trailing unescaped `\` inside
+// a quoted string is treated as a literal `\` (matching upsd's lenient
+// behavior) — the function deliberately never returns an error so the
+// caller doesn't have to thread one through, but malformed inputs always
+// produce *some* string and never panic.
+func unquote(s string) string {
 	if len(s) < 2 || s[0] != '"' || s[len(s)-1] != '"' {
-		return s, nil
+		return s
 	}
 	s = s[1 : len(s)-1]
 	var sb strings.Builder
@@ -368,7 +371,7 @@ func unquote(s string) (string, error) {
 		}
 		sb.WriteByte(c)
 	}
-	return sb.String(), nil
+	return sb.String()
 }
 
 // Quote wraps s in NUT-style double quotes, escaping `\` and `"`.

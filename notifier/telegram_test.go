@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mikispag/ups-client/monitor"
 )
@@ -112,6 +113,27 @@ func TestTelegramName(t *testing.T) {
 	tt.Label = "ops"
 	if tt.Name() != "telegram:ops" {
 		t.Errorf("labeled Name = %q", tt.Name())
+	}
+}
+
+func TestTelegramRedactsTokenInNetworkError(t *testing.T) {
+	// Point at a closed listener so http.Client.Do returns a *url.Error
+	// whose URL embeds the bot token.
+	tt := &TelegramTarget{
+		BotToken: "SECRET-TOKEN-12345",
+		ChatID:   "1",
+		APIBase:  "http://127.0.0.1:1", // refused
+		Timeout:  100 * time.Millisecond,
+	}
+	err := tt.Notify(context.Background(), sampleEvent(monitor.EventOnline))
+	if err == nil {
+		t.Fatal("expected network error")
+	}
+	if strings.Contains(err.Error(), "SECRET-TOKEN-12345") {
+		t.Errorf("bot token leaked into error: %v", err)
+	}
+	if !strings.Contains(err.Error(), "***") {
+		t.Errorf("expected redaction marker in %v", err)
 	}
 }
 

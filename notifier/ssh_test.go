@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -76,7 +77,7 @@ func TestSSHTargetRunsCommand(t *testing.T) {
 		InsecureIgnoreHostKey: true,
 		Command:               "logger -t ups '{{.Event}} on {{.UPS}}'",
 		Timeout:               2 * time.Second,
-		dial: func(network, addr string, cfg *ssh.ClientConfig) (sshClient, error) {
+		dial: func(_ context.Context, network, addr string, cfg *ssh.ClientConfig) (sshClient, error) {
 			if network != "tcp" {
 				t.Errorf("network = %q", network)
 			}
@@ -108,7 +109,7 @@ func TestSSHTargetDialError(t *testing.T) {
 	tt := &SSHTarget{
 		Host: "h", User: "u", PrivateKeyFile: keyPath, InsecureIgnoreHostKey: true,
 		Command: "true",
-		dial: func(network, addr string, cfg *ssh.ClientConfig) (sshClient, error) {
+		dial: func(_ context.Context, network, addr string, cfg *ssh.ClientConfig) (sshClient, error) {
 			return nil, errors.New("connection refused")
 		},
 	}
@@ -123,7 +124,7 @@ func TestSSHTargetSessionError(t *testing.T) {
 	tt := &SSHTarget{
 		Host: "h", User: "u", PrivateKeyFile: keyPath, InsecureIgnoreHostKey: true,
 		Command: "true",
-		dial: func(network, addr string, cfg *ssh.ClientConfig) (sshClient, error) {
+		dial: func(_ context.Context, network, addr string, cfg *ssh.ClientConfig) (sshClient, error) {
 			return &fakeSSHClient{err: errors.New("session denied")}, nil
 		},
 	}
@@ -131,6 +132,54 @@ func TestSSHTargetSessionError(t *testing.T) {
 		t.Error("expected session error")
 	}
 }
+
+func TestSSHTargetContextCancelClosesClient(t *testing.T) {
+	// Verifies the goroutine-leak fix: ctx cancel must reach the in-flight
+	// session via context.AfterFunc → client.Close, unblocking the fake
+	// session's CombinedOutput.
+	keyPath := writeTempKey(t)
+	closed := make(chan struct{})
+	tt := &SSHTarget{
+		Host: "h", User: "u", Command: "x",
+		PrivateKeyFile: keyPath, InsecureIgnoreHostKey: true,
+		dial: func(_ context.Context, network, addr string, cfg *ssh.ClientConfig) (sshClient, error) {
+			return &blockingSSHClient{closed: closed}, nil
+		},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { time.Sleep(50 * time.Millisecond); cancel() }()
+	err := tt.Notify(ctx, sampleEvent(monitor.EventOnline))
+	if err == nil {
+		t.Fatal("expected ctx.Err() after cancel")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("expected context.Canceled, got %v", err)
+	}
+}
+
+// blockingSSHClient is an sshClient whose Close unblocks an in-flight
+// CombinedOutput on its associated session. It models a real SSH session
+// being torn down by a remote close.
+type blockingSSHClient struct {
+	closed chan struct{}
+	once   sync.Once
+}
+
+func (b *blockingSSHClient) NewSession() (sshSession, error) {
+	return &blockingSSHSession{closed: b.closed}, nil
+}
+func (b *blockingSSHClient) Close() error {
+	b.once.Do(func() { close(b.closed) })
+	return nil
+}
+
+type blockingSSHSession struct{ closed chan struct{} }
+
+func (b *blockingSSHSession) CombinedOutput(string) ([]byte, error) {
+	<-b.closed
+	return nil, errors.New("session closed by remote")
+}
+func (b *blockingSSHSession) Close() error { return nil }
 
 func TestSSHTargetMissingFields(t *testing.T) {
 	tt := &SSHTarget{}
@@ -158,7 +207,7 @@ func TestSSHTargetPasswordAuth(t *testing.T) {
 	tt := &SSHTarget{
 		Host: "h", User: "u", Command: "true",
 		Password: "secret", InsecureIgnoreHostKey: true,
-		dial: func(network, addr string, cfg *ssh.ClientConfig) (sshClient, error) {
+		dial: func(_ context.Context, network, addr string, cfg *ssh.ClientConfig) (sshClient, error) {
 			if len(cfg.Auth) == 0 {
 				t.Error("expected at least one auth method")
 			}

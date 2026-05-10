@@ -115,11 +115,7 @@ func TestUnquoteAndQuote(t *testing.T) {
 		{`""`, ""},
 	}
 	for _, c := range cases {
-		got, err := unquote(c.in)
-		if err != nil {
-			t.Errorf("unquote(%q) err: %v", c.in, err)
-		}
-		if got != c.want {
+		if got := unquote(c.in); got != c.want {
 			t.Errorf("unquote(%q) = %q, want %q", c.in, got, c.want)
 		}
 	}
@@ -253,12 +249,16 @@ END LIST UPS`,
 
 func TestLogin(t *testing.T) {
 	fs := newFakeServer(t, map[string]string{
-		"USERNAME admin": "OK",
-		"PASSWORD secret": "OK",
-		"LOGIN ups":       "OK",
-		"USERNAME bad":    "OK",
-		"PASSWORD bad":    "ERR INVALID-PASSWORD",
-		"LOGOUT":          "OK Goodbye",
+		// Login quotes username and password so spaces and quotes don't
+		// frame-shift the upsd parser.
+		`USERNAME "admin"`:    "OK",
+		`PASSWORD "secret"`:   "OK",
+		`LOGIN ups`:           "OK",
+		`USERNAME "bad"`:      "OK",
+		`PASSWORD "bad"`:      "ERR INVALID-PASSWORD",
+		`USERNAME "u s er"`:   "OK",
+		`PASSWORD "p\"\\w"`:   "OK",
+		`LOGOUT`:              "OK Goodbye",
 	})
 	c, err := Dial(context.Background(), fs.addr, time.Second)
 	if err != nil {
@@ -288,6 +288,16 @@ func TestLogin(t *testing.T) {
 	defer c3.Close()
 	if err := c3.Login("", "", ""); err != nil {
 		t.Errorf("empty Login: %v", err)
+	}
+
+	// Credentials with spaces and quote characters must round-trip.
+	c4, err := Dial(context.Background(), fs.addr, time.Second)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer c4.Close()
+	if err := c4.Login("u s er", `p"\w`, ""); err != nil {
+		t.Errorf("quoted Login: %v", err)
 	}
 }
 

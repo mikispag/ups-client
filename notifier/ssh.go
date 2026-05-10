@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/mikispag/ups-client/monitor"
@@ -32,7 +33,7 @@ type SSHTarget struct {
 	Filter                Filter
 
 	// dial is overridable in tests.
-	dial func(network, addr string, cfg *ssh.ClientConfig) (sshClient, error)
+	dial func(ctx context.Context, network, addr string, cfg *ssh.ClientConfig) (sshClient, error)
 }
 
 // sshClient is the subset of *ssh.Client we use, so tests can fake it out.
@@ -162,46 +163,62 @@ func (t *SSHTarget) Notify(ctx context.Context, e monitor.Event) error {
 
 	dial := t.dial
 	if dial == nil {
-		dial = func(network, addr string, cfg *ssh.ClientConfig) (sshClient, error) {
-			c, err := ssh.Dial(network, addr, cfg)
+		dial = func(ctx context.Context, network, addr string, cfg *ssh.ClientConfig) (sshClient, error) {
+			d := &net.Dialer{Timeout: cfg.Timeout}
+			nconn, err := d.DialContext(ctx, network, addr)
 			if err != nil {
 				return nil, err
 			}
-			return realSSHClient{c: c}, nil
+			cliConn, chans, reqs, err := ssh.NewClientConn(nconn, addr, cfg)
+			if err != nil {
+				_ = nconn.Close()
+				return nil, err
+			}
+			return realSSHClient{c: ssh.NewClient(cliConn, chans, reqs)}, nil
 		}
 	}
 
-	// Run dial+session in a goroutine bounded by ctx.
+	// Run dial+session in a goroutine. context.AfterFunc closes the client
+	// handle on ctx cancel, which unblocks any in-flight session call so
+	// the goroutine returns promptly instead of leaking.
 	type result struct {
 		out []byte
 		err error
 	}
 	ch := make(chan result, 1)
 	go func() {
-		client, err := dial("tcp", addr, cfg)
+		client, err := dial(ctx, "tcp", addr, cfg)
 		if err != nil {
 			ch <- result{nil, fmt.Errorf("dial %s: %w", addr, err)}
 			return
 		}
+		// Close the client at most once, whether triggered by cancel or by
+		// our own cleanup. sync.Once gives us the happens-before edge the
+		// race detector wants between the AfterFunc and the explicit close.
+		var closeOnce sync.Once
+		closeClient := func() { closeOnce.Do(func() { _ = client.Close() }) }
+		stop := context.AfterFunc(ctx, closeClient)
+
 		sess, err := client.NewSession()
 		if err != nil {
-			_ = client.Close()
+			stop()
+			closeClient()
 			ch <- result{nil, err}
 			return
 		}
 		out, runErr := sess.CombinedOutput(cmd)
 		_ = sess.Close()
-		_ = client.Close()
+		stop()
+		closeClient()
 		ch <- result{out, runErr}
 	}()
 
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case r := <-ch:
-		if r.err != nil {
-			return fmt.Errorf("%s: %w (output: %s)", t.Name(), r.err, string(r.out))
+	r := <-ch
+	if r.err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
 		}
-		return nil
+		return fmt.Errorf("%s: %w (output: %s)", t.Name(), r.err, string(r.out))
 	}
+	return nil
 }

@@ -5,6 +5,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -162,8 +163,27 @@ func (c *Config) applyDefaults() {
 }
 
 func (c *Config) validate() error {
-	if c.Monitor.StatusInterval < 500*time.Millisecond {
-		return fmt.Errorf("monitor.status_interval must be >= 500ms, got %s", c.Monitor.StatusInterval)
+	// Reject zero/negative durations and unreasonably large polling
+	// intervals — those silently break monitoring.
+	for _, v := range []struct {
+		name string
+		d    time.Duration
+		min  time.Duration
+		max  time.Duration
+	}{
+		{"monitor.status_interval", c.Monitor.StatusInterval, 500 * time.Millisecond, 5 * time.Minute},
+		{"monitor.snapshot_interval", c.Monitor.SnapshotInterval, time.Second, 30 * time.Minute},
+		{"monitor.nocomm_threshold", c.Monitor.NoCommThreshold, 0, time.Hour},
+		{"monitor.replbatt_debounce", c.Monitor.ReplBattDebounce, 0, 24 * time.Hour},
+		{"monitor.reconnect_backoff", c.Monitor.ReconnectBackoff, 100 * time.Millisecond, time.Minute},
+		{"nut.timeout", c.NUT.Timeout, 100 * time.Millisecond, time.Minute},
+	} {
+		if v.d < v.min {
+			return fmt.Errorf("%s must be >= %s, got %s", v.name, v.min, v.d)
+		}
+		if v.d > v.max {
+			return fmt.Errorf("%s must be <= %s, got %s", v.name, v.max, v.d)
+		}
 	}
 	known := allEventNames()
 	check := func(target string, ev []string) error {
@@ -226,7 +246,7 @@ func sortedKeys(m map[string]struct{}) []string {
 	for k := range m {
 		out = append(out, k)
 	}
-	// not strictly necessary, but stable error messages help users debug
+	sort.Strings(out)
 	return out
 }
 

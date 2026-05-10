@@ -90,7 +90,9 @@ func (t *TelegramTarget) Notify(ctx context.Context, e monitor.Event) error {
 
 	resp, err := t.httpClient().Do(req)
 	if err != nil {
-		return err
+		// http.Client wraps the request URL into *url.Error, which would
+		// leak the bot token into logs/metrics. Redact it.
+		return fmt.Errorf("%s: %s", t.Name(), redactToken(err.Error(), t.BotToken))
 	}
 	defer resp.Body.Close()
 
@@ -109,6 +111,15 @@ func (t *TelegramTarget) Notify(ctx context.Context, e monitor.Event) error {
 		return fmt.Errorf("%s: HTTP %d", t.Name(), resp.StatusCode)
 	}
 	return nil
+}
+
+// redactToken replaces every occurrence of token in s with "***". A no-op
+// when token is empty.
+func redactToken(s, token string) string {
+	if token == "" {
+		return s
+	}
+	return strings.ReplaceAll(s, token, "***")
 }
 
 func (t *TelegramTarget) httpClient() *http.Client {
