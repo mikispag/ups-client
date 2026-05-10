@@ -164,7 +164,7 @@ Then enable the driver and server:
 sudo systemctl enable --now nut-driver@ups.service nut-server.service
 
 # Arch
-sudo systemctl enable --now nut-driver.service nut-server.service
+sudo systemctl enable --now nut-driver-enumerator.service nut-server.service
 ```
 
 Verify with `upsc ups@localhost` (if you installed `nut-client`) or with `ups-client -list`.
