@@ -92,6 +92,23 @@ Verify with `upsc ups@localhost` (if you installed `nut-client`) or with `ups-cl
 
 ## Build
 
+A `Makefile` wraps the common workflows:
+
+```bash
+make build       # → ./bin/ups-client (trimpath, stripped)
+make install     # → $GOBIN/ups-client
+make test        # plain unit tests
+make test-race   # with the race detector
+make cover       # writes coverage.out and prints the total
+make vet         # go vet ./...
+make check       # vet + race tests (what CI runs)
+make tidy        # go mod tidy
+make clean       # rm -rf bin/ coverage.out
+make help        # list targets
+```
+
+Or directly:
+
 ```bash
 go build -trimpath -o ups-client .
 ```
@@ -334,8 +351,8 @@ Drop `DynamicUser=yes` (and uncomment `User=`/`Group=`) if you need a fixed UID 
 ## Development
 
 ```bash
-go test -race -cover ./...
-go vet ./...
+make check       # go vet + race tests
+make cover       # coverage report
 ```
 
 ## License

@@ -25,14 +25,11 @@ jobs:
       - name: go mod verify
         run: go mod verify
 
-      - name: go vet
-        run: go vet ./...
+      - name: Vet
+        run: make vet
 
       - name: Build
-        run: go build -trimpath ./...
+        run: make build
 
       - name: Test (race + coverage)
-        run: go test -race -covermode=atomic -coverprofile=coverage.out ./...
-
-      - name: Coverage summary
-        run: go tool cover -func=coverage.out | tail -n 1
+        run: make cover
