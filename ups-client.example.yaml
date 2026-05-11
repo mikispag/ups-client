@@ -96,6 +96,12 @@ notifications:
     - name: ntfy
       url: https://ntfy.sh/your-private-topic
       headers:
+        # Notification icon shown in the ntfy Android/web client. Must be a
+        # publicly-accessible image URL — ntfy.sh fetches it server-side.
+        # Default is the battery emoji from Google's noto-emoji at 512×512
+        # (the universal UPS symbol, transparent background, crisp on
+        # xxxhdpi phones); swap for your own hosted image to taste.
+        Icon: https://raw.githubusercontent.com/googlefonts/noto-emoji/main/png/512/emoji_u1f50b.png
         Title: >-
           {{- if eq .Event "ONLINE" }}🟢 UPS {{.UPS}} · back on mains
           {{- else if eq .Event "ONBATT" }}🔌 UPS {{.UPS}} · running on battery

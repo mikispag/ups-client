@@ -306,7 +306,7 @@ CAL, NOTCAL, OFF, NOTOFF, ALARM, NOTALARM
 | `{{.Alarm}}` | `ups.alarm` reason string, captured when the `ALARM` token is asserted (e.g. `Replace battery`) |
 | `{{.Vars}}` | Raw map of every NUT variable (use `{{index .Vars "some.key"}}`) |
 
-> The bundled [`ups-client.example.yaml`](./ups-client.example.yaml) ships with **pretty, emoji-led message templates** wired up for every event — severity-tiered ntfy `Priority`/`Tags` (urgent for `FSD`/`NOCOMM`/`OVERLOAD`, high for `LOWBATT`/`REPLBATT`/`ALARM`/`ONBATT`/`COMMBAD`/`BYPASS`/`OFF`, default for transitions, low for `STARTUP`), a single `text/template` if/else chain on `.Event` per field, and a clean metric block. The snippets below show the pattern condensed; copy the full chains from the example file for production.
+> The bundled [`ups-client.example.yaml`](./ups-client.example.yaml) ships with **pretty, emoji-led message templates** wired up for every event — severity-tiered ntfy `Priority`/`Tags` (urgent for `FSD`/`NOCOMM`/`OVERLOAD`, high for `LOWBATT`/`REPLBATT`/`ALARM`/`ONBATT`/`COMMBAD`/`BYPASS`/`OFF`, default for transitions, low for `STARTUP`), an `Icon` header pointing at a publicly-hosted UPS battery PNG (Google's noto-emoji 512×512 — swap for any URL you control), a single `text/template` if/else chain on `.Event` per field, and a clean metric block. The snippets below show the pattern condensed; copy the full chains from the example file for production.
 
 Sample rendering (ntfy):
 
