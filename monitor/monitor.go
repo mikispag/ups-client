@@ -109,6 +109,7 @@ type Config struct {
 	SnapshotInterval time.Duration // bulk LIST VAR cadence (metadata refresh)
 	NoCommThreshold  time.Duration // sustained comm-bad before NOCOMM fires
 	ReplBattDebounce time.Duration // grace period to swallow APC BX RB flapping
+	AlarmDebounce    time.Duration // grace period to swallow APC BX ALARM blips
 	ReconnectBackoff time.Duration // initial reconnect backoff (caps at 30s)
 }
 
@@ -149,6 +150,9 @@ type Monitor struct {
 
 	rbFirstSeen time.Time
 	rbConfirmed bool
+
+	alarmFirstSeen time.Time
+	alarmConfirmed bool
 }
 
 // New constructs a Monitor with the given configuration, NUT dialer, and
@@ -260,9 +264,11 @@ func (m *Monitor) tryConnect(ctx context.Context) error {
 		m.emit(ctx, Event{Kind: EventCommOK, Snapshot: snap, Previous: m.last, Message: "communication restored"})
 		// Don't carry RB-debounce state across an outage: we couldn't
 		// observe the token during it, so any post-reconnect RB needs a
-		// fresh debounce window.
+		// fresh debounce window. Same reasoning for ALARM.
 		m.rbFirstSeen = time.Time{}
 		m.rbConfirmed = false
+		m.alarmFirstSeen = time.Time{}
+		m.alarmConfirmed = false
 	}
 
 	if !m.started {
@@ -308,6 +314,18 @@ func (m *Monitor) pollStatus(ctx context.Context) error {
 	}
 	snap.Vars["ups.status"] = raw
 
+	// Surface ups.alarm whenever ALARM is asserted so notifiers can render
+	// the actual reason ("Replace battery", "Battery overheated", ...). The
+	// fetch is best-effort: drivers don't always expose the variable, and a
+	// failure here must not tear the connection down.
+	if tokens.Has("ALARM") {
+		if a, aerr := m.conn.GetVar(m.cfg.UPS, "ups.alarm"); aerr == nil && a != "" {
+			snap.Vars["ups.alarm"] = a
+		}
+	} else {
+		delete(snap.Vars, "ups.alarm")
+	}
+
 	m.diffAndEmit(ctx, snap, tokens)
 	m.last = snap
 	m.prev = tokens
@@ -349,7 +367,7 @@ func (m *Monitor) diffAndEmit(ctx context.Context, snap Snapshot, cur nut.Status
 		entered := cur.Has(tok) && !prev.Has(tok)
 		left := !cur.Has(tok) && prev.Has(tok)
 
-		if tok == "RB" || tok == "LB" {
+		if tok == "RB" || tok == "LB" || tok == "ALARM" {
 			// Handled below with debounce / once-per-OB-session semantics.
 			continue
 		}
@@ -384,6 +402,27 @@ func (m *Monitor) diffAndEmit(ctx context.Context, snap Snapshot, cur nut.Status
 	} else {
 		m.rbFirstSeen = time.Time{}
 		m.rbConfirmed = false
+	}
+
+	// Alarm debounce — same shape as RB. APC BX firmwares briefly assert
+	// ALARM during periodic background self-tests; those blips clear well
+	// inside one minute and are never actionable. NOTALARM only fires if
+	// we previously confirmed (and emitted) ALARM, otherwise a debounced
+	// flap would surface as a bare NOTALARM with no matching ALARM.
+	if cur.Has("ALARM") {
+		if m.alarmFirstSeen.IsZero() {
+			m.alarmFirstSeen = now
+		}
+		if !m.alarmConfirmed && (m.cfg.AlarmDebounce <= 0 || now.Sub(m.alarmFirstSeen) >= m.cfg.AlarmDebounce) {
+			m.emit(ctx, Event{Kind: EventAlarm, Snapshot: snap, Previous: m.last, Message: m.describe(EventAlarm, snap)})
+			m.alarmConfirmed = true
+		}
+	} else {
+		if m.alarmConfirmed {
+			m.emit(ctx, Event{Kind: EventNotAlarm, Snapshot: snap, Previous: m.last, Message: m.describe(EventNotAlarm, snap)})
+		}
+		m.alarmFirstSeen = time.Time{}
+		m.alarmConfirmed = false
 	}
 }
 
@@ -445,6 +484,11 @@ func (m *Monitor) describe(kind EventKind, s Snapshot) string {
 	}
 	if l, ok := s.Vars["ups.load"]; ok {
 		parts = append(parts, "load="+l+"%")
+	}
+	if kind == EventAlarm {
+		if a, ok := s.Vars["ups.alarm"]; ok && a != "" {
+			parts = append(parts, "alarm="+a)
+		}
 	}
 	return strings.Join(parts, " ")
 }

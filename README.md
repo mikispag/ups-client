@@ -254,6 +254,7 @@ monitor:
   snapshot_interval: 30s     # bulk LIST VAR cadence
   nocomm_threshold: 60s      # COMMBAD ➜ NOCOMM after this much sustained loss
   replbatt_debounce: 600s    # hold RB this long before emitting REPLBATT
+  alarm_debounce: 60s        # hold ALARM this long before emitting ALARM
   reconnect_backoff: 1s      # initial backoff; doubles, caps at 30s
 ```
 
@@ -268,6 +269,7 @@ Three knobs at three layers — sane defaults for a BX2200MI in parentheses:
 | `usbhid-ups` driver (`ups.conf`) | `maxreport` | **`1`** | Read one HID report per polling pass. Avoids broken-length reads that surface as `DATA-STALE` and ghost `LB`/`RB` tokens. |
 | `usbhid-ups` driver (`ups.conf`) | `lbrb_log_delay_sec` | **`3`** | Suppress LB/RB transitions shorter than this. Catches sub-second blips. |
 | `ups-client` (`config.yaml`) | `monitor.replbatt_debounce` | **`600s`** | Only emit `REPLBATT` after the `RB` token has held continuously this long. Catches slow flaps the driver lets through. |
+| `ups-client` (`config.yaml`) | `monitor.alarm_debounce` | **`60s`** | Only emit `ALARM` after the `ALARM` token has held continuously this long. APC BX firmwares assert brief ALARMs during background self-tests; 60s suppresses those without meaningfully delaying real alarms. The `ups.alarm` variable is captured and exposed as `{{.Alarm}}` so notifier templates can render the actual reason ("Replace battery", …). |
 
 If you keep getting spurious `REPLBATT`, raise `replbatt_debounce` first; the driver-side knobs only need attention if you also see `DATA-STALE` or ghost `LOWBATT`s.
 
@@ -301,7 +303,8 @@ CAL, NOTCAL, OFF, NOTOFF, ALARM, NOTALARM
 | `{{.InputVoltage}}` / `{{.OutputVoltage}}` | Mains / output volts |
 | `{{.UPSLoad}}` | `ups.load` percent |
 | `{{.DeviceModel}}` / `{{.DeviceSerial}}` | From `device.*` |
-| `{{.Vars}}` | Raw map of every NUT variable (use `{{index .Vars "ups.alarm"}}`) |
+| `{{.Alarm}}` | `ups.alarm` reason string, captured when the `ALARM` token is asserted (e.g. `Replace battery`) |
+| `{{.Vars}}` | Raw map of every NUT variable (use `{{index .Vars "some.key"}}`) |
 
 > The bundled [`ups-client.example.yaml`](./ups-client.example.yaml) ships with **pretty, emoji-led message templates** wired up for every event — severity-tiered ntfy `Priority`/`Tags` (urgent for `FSD`/`NOCOMM`/`OVERLOAD`, high for `LOWBATT`/`REPLBATT`/`ALARM`/`ONBATT`/`COMMBAD`/`BYPASS`/`OFF`, default for transitions, low for `STARTUP`), a single `text/template` if/else chain on `.Event` per field, and a clean metric block. The snippets below show the pattern condensed; copy the full chains from the example file for production.
 
@@ -467,7 +470,7 @@ Detected by diffing successive `ups.status` token sets:
 | `BOOST` / `NOTBOOST` | `BOOST` token enter / leave (mains too low — SmartBoost) |
 | `CAL` / `NOTCAL` | runtime calibration enter / leave |
 | `OFF` / `NOTOFF` | output `OFF` token enter / leave |
-| `ALARM` / `NOTALARM` | active alarm enter / leave |
+| `ALARM` / `NOTALARM` | `ALARM` token persists past `alarm_debounce` / leaves after a confirmed alarm. `ups.alarm` is captured and exposed as `{{.Alarm}}` |
 | `COMMBAD` | TCP loss, `DATA-STALE`, or `DRIVER-NOT-CONNECTED` |
 | `COMMOK` | recovery from `COMMBAD` |
 | `NOCOMM` | sustained `COMMBAD` past `nocomm_threshold` |
@@ -539,6 +542,7 @@ This approach is preferred over editing `/etc/sudoers.d/` (no sudo dependency, n
 | `nut: NUT error: ACCESS-DENIED` | The UPS section requires auth; add `username` + `password` to `nut:`. |
 | `nut: NUT error: UNKNOWN-UPS` | `nut.ups` doesn't match the section name in `ups.conf`. |
 | Spurious `REPLBATT` | APC BX firmware quirk. Raise `monitor.replbatt_debounce` past the default `600s`, or tighten the driver-side `lbrb_log_delay_sec` in `ups.conf`. See [Tuning the APC-BX flap mitigation](#tuning-the-apc-bx-flap-mitigation). |
+| Spurious `ALARM` lasting a few seconds | APC BX firmware quirk — brief background self-tests assert `ALARM`. The default `monitor.alarm_debounce: 60s` suppresses any blip shorter than a minute. Raise it if you still see noise. The actual reason (when confirmed) is exposed as `{{.Alarm}}` in templates. |
 | Spurious `LOWBATT` while on mains | Should not happen any more: `LOWBATT` only fires when `LB` *and* `OB` are both set, since a bare `LB` on `OL` has no operational meaning (no shutdown is coming) and APC BX-series firmware asserts spurious `LB`+`RB` during background battery self-tests at full charge. If you genuinely want the bare-`LB` signal on `OL`, watch the `STARTUP`/`ONLINE` events instead and inspect `{{.Vars.ups_status}}` from a shell hook. |
 | `DATA-STALE` floods | The driver lost the device, or BX firmware returned a broken HID report length. Check `dmesg` for USB resets and make sure `maxreport = 1` is set in `ups.conf`. |
 

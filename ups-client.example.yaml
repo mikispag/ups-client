@@ -32,6 +32,11 @@ monitor:
   # Hold the RB token this long before emitting REPLBATT. APC BX-series
   # firmwares are known to flap; 600s smooths that out.
   replbatt_debounce: 600s
+  # Hold the ALARM token this long before emitting ALARM. APC BX-series
+  # firmwares assert brief (sub-minute) ALARMs during periodic background
+  # self-tests; 60s suppresses those without delaying real alarms much.
+  # When ALARM is confirmed, ups.alarm is fetched and surfaced via {{.Alarm}}.
+  alarm_debounce: 60s
   # Initial reconnect backoff (caps at 30s).
   reconnect_backoff: 1s
 
@@ -104,7 +109,7 @@ notifications:
           {{- else if eq .Event "NOTOVERLOAD" }}✅ UPS {{.UPS}} · overload cleared
           {{- else if eq .Event "BYPASS" }}⚡ UPS {{.UPS}} · bypass active
           {{- else if eq .Event "NOTBYPASS" }}✅ UPS {{.UPS}} · bypass cleared
-          {{- else if eq .Event "ALARM" }}⚠️ UPS {{.UPS}} · alarm
+          {{- else if eq .Event "ALARM" }}⚠️ UPS {{.UPS}} · alarm{{if .Alarm}}: {{.Alarm}}{{end}}
           {{- else if eq .Event "NOTALARM" }}✅ UPS {{.UPS}} · alarm cleared
           {{- else if eq .Event "STARTUP" }}🚀 UPS {{.UPS}} · ups-client started
           {{- else }}⚙️ UPS {{.UPS}} · {{.Event}}{{ end }}
@@ -143,7 +148,7 @@ notifications:
         {{- else if eq .Event "NOTOVERLOAD" }}✅ Overload condition cleared.
         {{- else if eq .Event "BYPASS" }}⚡ UPS in bypass — load is unprotected.
         {{- else if eq .Event "NOTBYPASS" }}✅ Bypass cleared — load is protected again.
-        {{- else if eq .Event "ALARM" }}⚠️ UPS reports an active alarm.
+        {{- else if eq .Event "ALARM" }}⚠️ UPS reports an active alarm{{if .Alarm}}: {{.Alarm}}{{end}}.
         {{- else if eq .Event "NOTALARM" }}✅ UPS alarm cleared.
         {{- else if eq .Event "STARTUP" }}🚀 ups-client connected and monitoring.
         {{- else }}⚙️ {{ .Event }}{{ end }}
@@ -196,7 +201,7 @@ notifications:
         {{- else if eq .Event "NOCOMM" }}🚨 UPS {{.UPS}} — UNREACHABLE
         {{- else if eq .Event "OVERLOAD" }}🔥 UPS {{.UPS}} — overload
         {{- else if eq .Event "BYPASS" }}⚡ UPS {{.UPS}} — bypass active
-        {{- else if eq .Event "ALARM" }}⚠️ UPS {{.UPS}} — alarm
+        {{- else if eq .Event "ALARM" }}⚠️ UPS {{.UPS}} — alarm{{if .Alarm}}: {{.Alarm}}{{end}}
         {{- else if eq .Event "STARTUP" }}🚀 UPS {{.UPS}} — ups-client started
         {{- else }}⚙️ UPS {{.UPS}} — {{.Event}}{{ end }}
 

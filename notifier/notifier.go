@@ -98,6 +98,7 @@ type TemplateData struct {
 	UPSLoad         string
 	DeviceModel     string
 	DeviceSerial    string
+	Alarm           string
 	Vars            map[string]string
 }
 
@@ -121,6 +122,7 @@ func NewTemplateData(e monitor.Event) TemplateData {
 		td.UPSLoad = e.Snapshot.Vars["ups.load"]
 		td.DeviceModel = e.Snapshot.Vars["device.model"]
 		td.DeviceSerial = e.Snapshot.Vars["device.serial"]
+		td.Alarm = e.Snapshot.Vars["ups.alarm"]
 	}
 	return td
 }
@@ -148,6 +150,7 @@ func (td TemplateData) Env() []string {
 	add("UPS_LOAD", td.UPSLoad)
 	add("UPS_DEVICE_MODEL", td.DeviceModel)
 	add("UPS_DEVICE_SERIAL", td.DeviceSerial)
+	add("UPS_ALARM", td.Alarm)
 	return env
 }
 

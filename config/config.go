@@ -45,6 +45,7 @@ type MonitorConfig struct {
 	SnapshotInterval time.Duration `yaml:"snapshot_interval"`
 	NoCommThreshold  time.Duration `yaml:"nocomm_threshold"`
 	ReplBattDebounce time.Duration `yaml:"replbatt_debounce"`
+	AlarmDebounce    time.Duration `yaml:"alarm_debounce"`
 	ReconnectBackoff time.Duration `yaml:"reconnect_backoff"`
 }
 
@@ -157,6 +158,9 @@ func (c *Config) applyDefaults() {
 	if c.Monitor.ReplBattDebounce == 0 {
 		c.Monitor.ReplBattDebounce = 600 * time.Second
 	}
+	if c.Monitor.AlarmDebounce == 0 {
+		c.Monitor.AlarmDebounce = 60 * time.Second
+	}
 	if c.Monitor.ReconnectBackoff == 0 {
 		c.Monitor.ReconnectBackoff = time.Second
 	}
@@ -178,6 +182,7 @@ func (c *Config) validate() error {
 		// (rather than the unreachable monitor.go disable sentinel of 0).
 		{"monitor.nocomm_threshold", c.Monitor.NoCommThreshold, time.Second, time.Hour},
 		{"monitor.replbatt_debounce", c.Monitor.ReplBattDebounce, time.Second, 24 * time.Hour},
+		{"monitor.alarm_debounce", c.Monitor.AlarmDebounce, time.Second, time.Hour},
 		{"monitor.reconnect_backoff", c.Monitor.ReconnectBackoff, 100 * time.Millisecond, time.Minute},
 		{"nut.timeout", c.NUT.Timeout, 100 * time.Millisecond, time.Minute},
 	} {
@@ -318,6 +323,7 @@ func (c *Config) MonitorRuntimeConfig() monitor.Config {
 		SnapshotInterval: c.Monitor.SnapshotInterval,
 		NoCommThreshold:  c.Monitor.NoCommThreshold,
 		ReplBattDebounce: c.Monitor.ReplBattDebounce,
+		AlarmDebounce:    c.Monitor.AlarmDebounce,
 		ReconnectBackoff: c.Monitor.ReconnectBackoff,
 	}
 }

@@ -206,6 +206,64 @@ func TestMonitorReplBattConfirmed(t *testing.T) {
 	}
 }
 
+func TestMonitorAlarmDebounce(t *testing.T) {
+	// ALARM rises then clears within the debounce window — APC BX self-test
+	// pattern. Neither ALARM nor NOTALARM must fire (NOTALARM without a
+	// matching ALARM would be a confusing notification).
+	fc := &fakeConn{statusSeq: []string{"OL", "OL ALARM", "OL"}, listVars: map[string]string{}}
+	rs := &recordingSink{}
+	cfg := Config{
+		UPS:              "ups",
+		StatusInterval:   10 * time.Millisecond,
+		SnapshotInterval: time.Hour,
+		ReconnectBackoff: 5 * time.Millisecond,
+		AlarmDebounce:    500 * time.Millisecond,
+	}
+	m := New(cfg, func(ctx context.Context) (Conn, error) { return fc, nil }, rs, nil)
+	runFor(t, m, 3)
+	for _, e := range rs.events {
+		if e.Kind == EventAlarm || e.Kind == EventNotAlarm {
+			t.Errorf("ALARM/NOTALARM should have been debounced; got %v", rs.Kinds())
+		}
+	}
+}
+
+func TestMonitorAlarmConfirmedSurfacesReason(t *testing.T) {
+	// ALARM persists past the debounce — should emit exactly once, and the
+	// snapshot must carry ups.alarm so notifier templates can render the
+	// actual reason instead of a bare "alarm" string.
+	fc := &fakeConn{
+		statusSeq: []string{"OL ALARM"},
+		listVars:  map[string]string{"ups.alarm": "Replace battery"},
+	}
+	rs := &recordingSink{}
+	cfg := Config{
+		UPS:              "ups",
+		StatusInterval:   10 * time.Millisecond,
+		SnapshotInterval: time.Hour,
+		ReconnectBackoff: 5 * time.Millisecond,
+		AlarmDebounce:    20 * time.Millisecond,
+	}
+	m := New(cfg, func(ctx context.Context) (Conn, error) { return fc, nil }, rs, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	_ = m.Run(ctx)
+	count := 0
+	var alarmEvent Event
+	for _, e := range rs.events {
+		if e.Kind == EventAlarm {
+			count++
+			alarmEvent = e
+		}
+	}
+	if count != 1 {
+		t.Fatalf("expected exactly 1 ALARM, got %d (%v)", count, rs.Kinds())
+	}
+	if got := alarmEvent.Snapshot.Vars["ups.alarm"]; got != "Replace battery" {
+		t.Errorf("ALARM snapshot missing ups.alarm reason: got %q", got)
+	}
+}
+
 func TestMonitorBypassEnterLeave(t *testing.T) {
 	m, rs, _ := newMonitorWithStatus(t, "OL", "OL BYPASS", "OL")
 	runFor(t, m, 3)
