@@ -89,7 +89,10 @@ func IsTransient(err error) bool {
 // appended. timeout bounds dialing and each complete command/response exchange;
 // pass 0 to disable deadlines.
 func Dial(ctx context.Context, addr string, timeout time.Duration) (*Client, error) {
-	host := strings.TrimSuffix(strings.TrimPrefix(addr, "["), "]")
+	host := addr
+	if strings.HasPrefix(addr, "[") && strings.HasSuffix(addr, "]") {
+		host = addr[1 : len(addr)-1]
+	}
 	if _, err := netip.ParseAddr(host); err == nil || !strings.Contains(addr, ":") {
 		addr = net.JoinHostPort(host, fmt.Sprint(DefaultPort))
 	}
@@ -138,10 +141,19 @@ func (c *Client) writeLine(line string) (int, error) {
 	if err == nil && n != len(line)+1 {
 		err = io.ErrShortWrite
 	}
+	if err != nil {
+		_ = c.Close()
+	}
 	return n, err
 }
 
-func (c *Client) readLine() (string, error) {
+func (c *Client) readLine() (line string, err error) {
+	defer func() {
+		var pe *ProtocolError
+		if err != nil && !errors.As(err, &pe) {
+			_ = c.Close()
+		}
+	}()
 	var buf []byte
 	for {
 		part, err := c.rd.ReadSlice('\n')
@@ -157,7 +169,7 @@ func (c *Client) readLine() (string, error) {
 		}
 		break
 	}
-	line := strings.TrimSuffix(strings.TrimSuffix(string(buf), "\n"), "\r")
+	line = strings.TrimSuffix(strings.TrimSuffix(string(buf), "\n"), "\r")
 	if err := validateArguments(line); err != nil {
 		return "", err
 	}
@@ -165,6 +177,11 @@ func (c *Client) readLine() (string, error) {
 	if len(fields) > 0 && fields[0] == "ERR" {
 		if len(fields) < 2 {
 			return "", fmt.Errorf("nut: malformed error response")
+		}
+		for _, ch := range fields[1] {
+			if ch != '-' && (ch < 'A' || ch > 'Z') {
+				return "", fmt.Errorf("nut: malformed error code %q", fields[1])
+			}
 		}
 		return line, &ProtocolError{Code: fields[1]}
 	}
@@ -181,7 +198,7 @@ func validateArguments(args ...string) error {
 }
 
 func wireToken(s string) string {
-	if s == "" || strings.ContainsAny(s, " \t\"\\") {
+	if s == "" || strings.ContainsAny(s, " \t\v\f\"\\#=") {
 		return Quote(s)
 	}
 	return s
@@ -193,6 +210,7 @@ func (c *Client) commandOK(cmd, want string) error {
 		return err
 	}
 	if line != want {
+		_ = c.Close()
 		return fmt.Errorf("nut: unexpected response %q (want %q)", line, want)
 	}
 	return nil
@@ -297,9 +315,11 @@ func (c *Client) GetVar(ups, name string) (string, error) {
 	}
 	v, err := parseVarLine(line)
 	if err != nil {
+		_ = c.Close()
 		return "", err
 	}
 	if v.UPS != ups || v.Name != name {
+		_ = c.Close()
 		return "", fmt.Errorf("nut: response does not match requested variable: %q", line)
 	}
 	return v.Value, nil
@@ -344,7 +364,7 @@ func (c *Client) ListUPS() (map[string]string, error) {
 	return out, nil
 }
 
-func (c *Client) list(cmd, beginPrefix, endPrefix string, onLine func(string) error) error {
+func (c *Client) list(cmd, beginPrefix, endPrefix string, onLine func(string) error) (err error) {
 	if _, err := c.writeLine(cmd); err != nil {
 		return err
 	}
@@ -353,8 +373,16 @@ func (c *Client) list(cmd, beginPrefix, endPrefix string, onLine func(string) er
 		return err
 	}
 	if !sameTokens(first, beginPrefix) {
+		_ = c.Close()
 		return fmt.Errorf("nut: unexpected response %q (want %q)", first, beginPrefix)
 	}
+	// Once a LIST begins, any failure leaves its remaining rows unread.
+	// Reusing that stream could mistake stale rows for a new command's reply.
+	defer func() {
+		if err != nil {
+			_ = c.Close()
+		}
+	}()
 	// Include a CRLF allowance for each line, even when the server uses LF.
 	responseBytes := len(first) + 2
 	for {
@@ -364,7 +392,6 @@ func (c *Client) list(cmd, beginPrefix, endPrefix string, onLine func(string) er
 		}
 		responseBytes += len(line) + 2
 		if responseBytes > 1<<20 {
-			_ = c.Close()
 			return fmt.Errorf("nut: LIST response exceeds 1 MiB")
 		}
 		if sameTokens(line, endPrefix) {
@@ -427,7 +454,7 @@ func sameTokens(a, b string) bool {
 
 func parseTokens(line string) ([]string, error) {
 	var fields []string
-	for line = strings.TrimSpace(line); line != ""; line = strings.TrimSpace(line) {
+	for line = strings.Trim(line, " \t\v\f"); line != ""; line = strings.Trim(line, " \t\v\f") {
 		i := 0
 		if line[0] == '"' {
 			for i = 1; i < len(line) && line[i] != '"'; i++ {
@@ -439,11 +466,11 @@ func parseTokens(line string) ([]string, error) {
 				return nil, fmt.Errorf("nut: unterminated quoted token")
 			}
 			i++
-			if i < len(line) && line[i] != ' ' && line[i] != '\t' {
+			if i < len(line) && !strings.ContainsRune(" \t\v\f", rune(line[i])) {
 				return nil, fmt.Errorf("nut: missing token separator")
 			}
 		} else {
-			for i < len(line) && line[i] != ' ' && line[i] != '\t' {
+			for i < len(line) && !strings.ContainsRune(" \t\v\f", rune(line[i])) {
 				if line[i] == '"' || line[i] == '\\' {
 					return nil, fmt.Errorf("nut: malformed bare token")
 				}
@@ -481,14 +508,16 @@ func unquote(s string) string {
 	return sb.String()
 }
 
-// Quote wraps s in NUT-style double quotes, escaping `\` and `"`.
+// Quote wraps s in NUT-style double quotes, escaping `\`, `"`, and `#`.
+// NUT's shared configuration/wire parser treats unescaped # as a comment,
+// even inside a quoted token.
 func Quote(s string) string {
 	var sb strings.Builder
 	sb.Grow(len(s) + 2)
 	sb.WriteByte('"')
 	for i := 0; i < len(s); i++ {
 		c := s[i]
-		if c == '\\' || c == '"' {
+		if c == '\\' || c == '"' || c == '#' {
 			sb.WriteByte('\\')
 		}
 		sb.WriteByte(c)

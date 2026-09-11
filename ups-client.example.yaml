@@ -85,7 +85,7 @@ notifications:
     # No sudo, no setuid wrapper.
     - name: poweroff
       command: /usr/bin/systemctl
-      args: ["--no-block", "poweroff"]
+      args: ["--no-block", "--check-inhibitors=no", "poweroff"]
       timeout: 10s
       events: [LOWBATT, FSD]
 

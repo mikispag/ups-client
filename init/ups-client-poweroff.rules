@@ -1,8 +1,7 @@
 // Allow the ups-client system user to trigger an immediate poweroff via
-// `systemctl poweroff`. The FSD (forced shutdown) notifier in ups-client's
-// example config invokes this when the UPS asserts FSD: at that point the
-// battery is critically low and the system has seconds to power off
-// cleanly.
+// `systemctl --check-inhibitors=no poweroff`. The LOWBATT/FSD notifier
+// invokes this when the battery is critically low. Unrelated application
+// inhibitors must not prevent an emergency shutdown before power is lost.
 //
 // Without this rule, logind's default policy requires an active local
 // session for power-off, so the daemon's call would fail.
@@ -16,8 +15,10 @@ polkit.addRule(function(action, subject) {
     }
     if (action.id === "org.freedesktop.login1.power-off" ||
         action.id === "org.freedesktop.login1.power-off-multiple-sessions" ||
+        action.id === "org.freedesktop.login1.power-off-ignore-inhibit" ||
         action.id === "org.freedesktop.login1.halt" ||
-        action.id === "org.freedesktop.login1.halt-multiple-sessions") {
+        action.id === "org.freedesktop.login1.halt-multiple-sessions" ||
+        action.id === "org.freedesktop.login1.halt-ignore-inhibit") {
         return polkit.Result.YES;
     }
     return null;

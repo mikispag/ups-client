@@ -103,7 +103,19 @@ func (t *WebhookTarget) Notify(ctx context.Context, e monitor.Event) error {
 		if rerr != nil {
 			return rerr
 		}
-		req.Header.Set(k, rendered)
+		if strings.EqualFold(k, "Host") {
+			// net/http sends Host from Request.Host, not the Header map.
+			// It silently drops invalid hosts, so reject them before sending.
+			if rendered != "" {
+				u, err := url.Parse("http://" + rendered)
+				if err != nil || u.Host != rendered || u.User != nil || u.Hostname() == "" {
+					return fmt.Errorf("%s: invalid Host header", t.Name())
+				}
+			}
+			req.Host = rendered
+		} else {
+			req.Header.Set(k, rendered)
+		}
 	}
 
 	client := t.httpClient()

@@ -686,3 +686,134 @@ func TestMonitorCriticalEventsPrecedeOtherNotifications(t *testing.T) {
 		})
 	}
 }
+
+type alarmProbeConn struct {
+	*fakeConn
+	alarm func() (string, error)
+}
+
+func (c *alarmProbeConn) GetVar(ups, name string) (string, error) {
+	if name == "ups.alarm" {
+		return c.alarm()
+	}
+	return c.fakeConn.GetVar(ups, name)
+}
+
+func TestMonitorCriticalStatusPrecedesOptionalAlarmRead(t *testing.T) {
+	m, rs, fc := newMonitorWithStatus(t, "OL")
+	ctx := context.Background()
+	if err := m.tryConnect(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer m.closeConn()
+	rs.events = nil
+	fc.statusSeq = []string{"OB LB FSD ALARM"}
+	c := &alarmProbeConn{fakeConn: fc, alarm: func() (string, error) {
+		if !slices.Equal(rs.Kinds(), []EventKind{EventFSD, EventLowBatt}) {
+			t.Errorf("optional alarm read preceded critical status events: %v", rs.Kinds())
+		}
+		return "", io.EOF
+	}}
+	m.conn = c
+	if err := m.pollStatus(ctx); !errors.Is(err, io.EOF) {
+		t.Fatalf("poll error = %v", err)
+	}
+	if m.last.Status != "OB LB FSD ALARM" {
+		t.Errorf("alarm failure discarded observed status: %q", m.last.Status)
+	}
+	for _, kind := range []EventKind{EventFSD, EventLowBatt} {
+		count := 0
+		for _, event := range rs.events {
+			if event.Kind == kind {
+				count++
+			}
+		}
+		if count != 1 {
+			t.Errorf("%s emitted %d times", kind, count)
+		}
+	}
+}
+
+func TestMonitorDebounceUsesObservationTime(t *testing.T) {
+	m, rs, _ := newMonitorWithStatus(t, "OL")
+	m.cfg.ReplBattDebounce = time.Minute
+	m.cfg.AlarmDebounce = time.Minute
+	observed := time.Now().Add(-time.Hour)
+	status := nut.ParseStatus("OL RB ALARM")
+	snap := Snapshot{UPS: "ups", Status: "OL RB ALARM", Tokens: status.Tokens(), Time: observed}
+	m.diffAndEmit(context.Background(), snap, status)
+	if m.rbFirstSeen != observed || m.alarmFirstSeen != observed {
+		t.Errorf("debounce started at dispatch time: RB=%v ALARM=%v, observation=%v", m.rbFirstSeen, m.alarmFirstSeen, observed)
+	}
+	m.prev = status
+	m.last = snap
+	snap.Time = observed.Add(2 * time.Minute)
+	m.diffAndEmit(context.Background(), snap, status)
+	if !slices.Contains(rs.Kinds(), EventReplBatt) || !slices.Contains(rs.Kinds(), EventAlarm) {
+		t.Errorf("observed sustained faults were not confirmed: %v", rs.Kinds())
+	}
+}
+
+func TestMonitorOptionalAlarmDoesNotMutateDispatchedSnapshots(t *testing.T) {
+	m, rs, fc := newMonitorWithStatus(t, "OL")
+	ctx := context.Background()
+	if err := m.tryConnect(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer m.closeConn()
+	fc.statusSeq = []string{"OB LB FSD ALARM"}
+	fc.listVars["ups.alarm"] = "Battery overheated"
+	if err := m.pollStatus(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range rs.events {
+		if (e.Kind == EventFSD || e.Kind == EventLowBatt) && e.Snapshot.Get("ups.alarm") != "" {
+			t.Errorf("%s snapshot mutated after dispatch: %v", e.Kind, e.Snapshot.Vars)
+		}
+	}
+	if m.last.Get("ups.alarm") != "Battery overheated" {
+		t.Errorf("alarm enrichment lost: %v", m.last.Vars)
+	}
+}
+
+func TestMonitorDebounceDoesNotCountDispatchDelay(t *testing.T) {
+	m, rs, _ := newMonitorWithStatus(t, "OL")
+	m.cfg.ReplBattDebounce = time.Minute
+	m.cfg.AlarmDebounce = time.Minute
+	m.rbFirstSeen = time.Now().Add(-2 * time.Minute)
+	m.alarmFirstSeen = m.rbFirstSeen
+	m.started = true
+	status := nut.ParseStatus("OL RB ALARM")
+	m.prev = status
+	snap := Snapshot{UPS: "ups", Status: "OL RB ALARM", Tokens: status.Tokens(), Time: m.rbFirstSeen.Add(30 * time.Second)}
+	m.diffAndEmit(context.Background(), snap, status)
+	if slices.Contains(rs.Kinds(), EventReplBatt) || slices.Contains(rs.Kinds(), EventAlarm) {
+		t.Errorf("time after observation confirmed faults: %v", rs.Kinds())
+	}
+}
+
+func TestMonitorBacksOffRepeatedPollingFailures(t *testing.T) {
+	var attempts []time.Time
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	m := New(Config{UPS: "ups", StatusInterval: time.Millisecond, SnapshotInterval: time.Hour, ReconnectBackoff: 20 * time.Millisecond},
+		func(context.Context) (Conn, error) {
+			attempts = append(attempts, time.Now())
+			if len(attempts) == 3 {
+				cancel()
+			}
+			return &fakeConn{failGet: io.EOF}, nil
+		}, nil, nil)
+	if err := m.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(attempts) != 3 {
+		t.Fatalf("expected two reconnects: %d attempts", len(attempts))
+	}
+	for i := 1; i < len(attempts); i++ {
+		minimum := 20 * time.Millisecond * time.Duration(1<<(i-1))
+		if elapsed := attempts[i].Sub(attempts[i-1]); elapsed < minimum {
+			t.Fatalf("reconnect %d waited %v, want at least %v", i, elapsed, minimum)
+		}
+	}
+}

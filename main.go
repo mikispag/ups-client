@@ -122,6 +122,13 @@ func buildTLSConfig(t *config.TLSConfig) (*tls.Config, error) {
 		ServerName:         t.ServerName,
 	}
 	if t.CAFile != "" {
+		info, err := os.Stat(t.CAFile)
+		if err != nil {
+			return nil, fmt.Errorf("stat ca_file: %w", err)
+		}
+		if !info.Mode().IsRegular() {
+			return nil, fmt.Errorf("ca_file %q must be a regular file", t.CAFile)
+		}
 		pem, err := os.ReadFile(t.CAFile)
 		if err != nil {
 			return nil, fmt.Errorf("read ca_file: %w", err)

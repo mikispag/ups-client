@@ -3,6 +3,7 @@ package notifier
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -90,7 +91,7 @@ func (t *TelegramTarget) Notify(ctx context.Context, e monitor.Event) error {
 	if err != nil {
 		// url.Parse failures embed the full URL (with bot token) in the
 		// returned error — redact the same way as the Do() path below.
-		return fmt.Errorf("%s: %s", t.Name(), redactToken(err.Error(), t.BotToken))
+		return t.requestError(err)
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
@@ -98,13 +99,13 @@ func (t *TelegramTarget) Notify(ctx context.Context, e monitor.Event) error {
 	if err != nil {
 		// http.Client wraps the request URL into *url.Error, which would
 		// leak the bot token into logs/metrics. Redact it.
-		return fmt.Errorf("%s: %s", t.Name(), redactToken(err.Error(), t.BotToken))
+		return t.requestError(err)
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
 	if err != nil {
-		return fmt.Errorf("%s: read response: %s", t.Name(), redactToken(err.Error(), t.BotToken))
+		return t.requestError(fmt.Errorf("read response: %w", err))
 	}
 	if len(body) > maxResponseBytes {
 		return fmt.Errorf("%s: response exceeds %d bytes", t.Name(), maxResponseBytes)
@@ -128,6 +129,17 @@ func (t *TelegramTarget) Notify(ctx context.Context, e monitor.Event) error {
 		return fmt.Errorf("%s: invalid API response", t.Name())
 	}
 	return nil
+}
+
+func (t *TelegramTarget) requestError(err error) error {
+	// Preserve cancellation identity without exposing the credential-bearing
+	// URL carried by http.Client errors.
+	for _, cause := range []error{context.Canceled, context.DeadlineExceeded} {
+		if errors.Is(err, cause) {
+			return fmt.Errorf("%s: %w", t.Name(), cause)
+		}
+	}
+	return fmt.Errorf("%s: %s", t.Name(), redactToken(err.Error(), t.BotToken))
 }
 
 // redactToken replaces every occurrence of token in s with "***", in both

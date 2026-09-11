@@ -319,6 +319,17 @@ func TestDialDefaultPort(t *testing.T) {
 	}
 }
 
+func TestDialPreservesScopedIPv6ExplicitPort(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	const address = "[fe80::1%eth0]:12345"
+	_, err := Dial(ctx, address, time.Second)
+	var opErr *net.OpError
+	if !errors.As(err, &opErr) || opErr.Addr == nil || opErr.Addr.String() != address {
+		t.Fatalf("Dial changed scoped IPv6 address or explicit port: %v", err)
+	}
+}
+
 func TestIsTransient(t *testing.T) {
 	if IsTransient(nil) {
 		t.Error("nil should not be transient")
@@ -389,10 +400,17 @@ type recordingConn struct {
 	net.Conn
 	input  *strings.Reader
 	output strings.Builder
+	closed bool
 }
 
-func (c *recordingConn) Read(p []byte) (int, error)  { return c.input.Read(p) }
-func (c *recordingConn) Write(p []byte) (int, error) { return c.output.Write(p) }
+func (c *recordingConn) Read(p []byte) (int, error) { return c.input.Read(p) }
+func (c *recordingConn) Write(p []byte) (int, error) {
+	if c.closed {
+		return 0, net.ErrClosed
+	}
+	return c.output.Write(p)
+}
+func (c *recordingConn) Close() error { c.closed = true; return nil }
 
 func TestRejectCommandInjection(t *testing.T) {
 	for _, call := range []func(*Client) error{
@@ -637,5 +655,80 @@ func TestListTimeoutCoversWholeResponse(t *testing.T) {
 		case <-limit.C:
 			t.Fatal("LIST rows kept extending the command deadline")
 		}
+	}
+}
+
+func TestIncompleteListCannotContaminateNextCommand(t *testing.T) {
+	for _, badLine := range []string{"GARBAGE", "ERR VAR-NOT-SUPPORTED"} {
+		t.Run(badLine, func(t *testing.T) {
+			conn := &recordingConn{input: strings.NewReader("BEGIN LIST VAR ups\n" + badLine + "\nVAR ups ups.status \"OL\"\nEND LIST VAR ups\n")}
+			c := &Client{conn: conn, rd: bufio.NewReader(conn)}
+			if _, err := c.ListVars("ups"); err == nil {
+				t.Fatal("expected invalid LIST response error")
+			}
+			if value, err := c.GetVar("ups", "ups.status"); err == nil {
+				t.Fatalf("reused abandoned LIST data as new GET response: %q", value)
+			}
+			if !conn.closed {
+				t.Fatal("connection remained open after incomplete LIST")
+			}
+		})
+	}
+}
+
+func TestMalformedFrameClosesConnection(t *testing.T) {
+	for _, response := range []string{
+		"VAR other ups.status \"OL\"\n", "VAR ups ups.status \"OL\n",
+		"ERR\n", "ERR \"\"\n", "ERR invalid-code\n", "ERR \"DATA-STALE\"\n",
+		"VAR ups ups.status \"OL\"\x00\n", strings.Repeat("x", 65536) + "\n",
+	} {
+		conn := &recordingConn{input: strings.NewReader(response)}
+		c := &Client{conn: conn, rd: bufio.NewReader(conn)}
+		if _, err := c.GetVar("ups", "ups.status"); err == nil {
+			t.Fatal("accepted malformed response")
+		}
+		if !conn.closed {
+			t.Errorf("connection remained open after malformed frame (%d bytes)", len(response))
+		}
+	}
+}
+
+func TestCommandErrorKeepsConnectionUsable(t *testing.T) {
+	conn := &recordingConn{input: strings.NewReader("ERR VAR-NOT-SUPPORTED optional detail\nVAR ups ups.status \"OB\"\n")}
+	c := &Client{conn: conn, rd: bufio.NewReader(conn)}
+	if _, err := c.ListVars("ups"); !errors.Is(err, &ProtocolError{Code: "VAR-NOT-SUPPORTED"}) {
+		t.Fatalf("LIST error = %v", err)
+	}
+	if value, err := c.GetVar("ups", "ups.status"); err != nil || value != "OB" {
+		t.Fatalf("valid command-level ERR prevented fallback GET: %q, %v", value, err)
+	}
+}
+
+func TestNUTParserSpecialCharacters(t *testing.T) {
+	fs := newFakeServer(t, map[string]string{
+		`USERNAME "user\#one"`: "OK", `PASSWORD "pass\#word"`: "OK",
+		`GET VAR "ups=one" ups.status`:    `VAR "ups=one" ups.status "OL"`,
+		`GET VAR "ups\#one" ups.status`:   `VAR "ups\#one" ups.status "OL"`,
+		"GET VAR \"ups\vone\" ups.status": "VAR \"ups\vone\" ups.status \"OL\"",
+	})
+	c, err := Dial(context.Background(), fs.addr, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if err := c.Login("user#one", "pass#word", ""); err != nil {
+		t.Errorf("NUT hash-escaped credentials rejected: %v", err)
+	}
+	for _, ups := range []string{"ups=one", "ups#one", "ups\vone"} {
+		if value, err := c.GetVar(ups, "ups.status"); err != nil || value != "OL" {
+			t.Errorf("GetVar(%q) = %q, %v", ups, value, err)
+		}
+	}
+}
+
+func TestParseTokensPreservesNonASCIIWhitespace(t *testing.T) {
+	got, err := parseTokens("VAR ups device.model model\u00a0")
+	if err != nil || len(got) != 4 || got[3] != "model\u00a0" {
+		t.Fatalf("non-ASCII byte data was changed: %q, %v", got, err)
 	}
 }

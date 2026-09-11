@@ -2,7 +2,6 @@ package notifier
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -67,8 +66,9 @@ func (t *ShellTarget) Notify(ctx context.Context, e monitor.Event) error {
 	var out limitedOutput
 	cmd.Stdout, cmd.Stderr = &out, &out
 	err := cmd.Run()
-	if errors.Is(err, exec.ErrWaitDelay) {
-		// The direct child exited, but descendants still own its output pipes.
+	if err != nil && cmd.Process != nil {
+		// Kill surviving descendants on every failure. A nonzero parent exit
+		// masks ErrWaitDelay even when descendants still hold its output pipes.
 		_ = cmd.Cancel()
 	}
 	if err != nil {

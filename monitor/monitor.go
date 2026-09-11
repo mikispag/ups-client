@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"sort"
 	"strings"
 	"time"
@@ -196,23 +197,22 @@ func (m *Monitor) Run(ctx context.Context) error {
 			return nil
 		}
 		if m.conn == nil {
+			if m.commBad {
+				if !m.waitReconnect(ctx, backoff) {
+					return nil
+				}
+				backoff *= 2
+				if backoff > maxBackoff {
+					backoff = maxBackoff
+				}
+			}
 			if err := m.tryConnect(ctx); err != nil {
 				if ctx.Err() != nil {
 					return nil
 				}
 				m.markCommBad(ctx, fmt.Sprintf("connect: %v", err))
-				if !m.waitReconnect(ctx, backoff) {
-					return nil
-				}
-				if backoff < maxBackoff {
-					backoff *= 2
-					if backoff > maxBackoff {
-						backoff = maxBackoff
-					}
-				}
 				continue
 			}
-			backoff = m.cfg.ReconnectBackoff
 		}
 
 		select {
@@ -221,10 +221,14 @@ func (m *Monitor) Run(ctx context.Context) error {
 		case <-statusTicker.C:
 			if err := m.pollStatus(ctx); err != nil {
 				m.handleConnErr(ctx, "status", err)
+			} else {
+				backoff = m.cfg.ReconnectBackoff
 			}
 		case <-snapTicker.C:
 			if err := m.refreshVars(ctx); err != nil {
 				m.handleConnErr(ctx, "snapshot", err)
+			} else {
+				backoff = m.cfg.ReconnectBackoff
 			}
 		}
 	}
@@ -346,27 +350,32 @@ func (m *Monitor) pollStatus(ctx context.Context) error {
 		snap.Vars = v
 	}
 	snap.Vars["ups.status"] = raw
+	delete(snap.Vars, "ups.alarm")
+
+	// A valid shutdown condition must not wait for optional metadata or be
+	// discarded if its follow-up read fails.
+	m.emitCritical(ctx, snap, tokens)
 
 	// Surface ups.alarm whenever ALARM is asserted so notifiers can render
 	// the actual reason ("Replace battery", "Battery overheated", ...). The
 	// fetch is best-effort: drivers don't always expose the variable. An
 	// unsupported variable is harmless, but transport failures invalidate
 	// the connection and cannot be ignored.
+	var alarmErr error
 	if tokens.Has("ALARM") {
-		delete(snap.Vars, "ups.alarm")
+		// Critical event consumers may retain the snapshot already dispatched.
+		snap.Vars = maps.Clone(snap.Vars)
 		if a, aerr := m.conn.GetVar(m.cfg.UPS, "ups.alarm"); aerr != nil && nut.IsTransient(aerr) {
-			return aerr
+			alarmErr = aerr
 		} else if aerr == nil && a != "" {
 			snap.Vars["ups.alarm"] = a
 		}
-	} else {
-		delete(snap.Vars, "ups.alarm")
 	}
 
-	m.diffAndEmit(ctx, snap, tokens)
+	m.emitOtherEdges(ctx, snap, tokens)
 	m.last = snap
 	m.prev = tokens
-	return nil
+	return alarmErr
 }
 
 func (m *Monitor) refreshVars(ctx context.Context) error {
@@ -397,10 +406,12 @@ func (m *Monitor) refreshVars(ctx context.Context) error {
 }
 
 func (m *Monitor) diffAndEmit(ctx context.Context, snap Snapshot, cur nut.Status) {
+	m.emitCritical(ctx, snap, cur)
+	m.emitOtherEdges(ctx, snap, cur)
+}
+
+func (m *Monitor) emitCritical(ctx context.Context, snap Snapshot, cur nut.Status) {
 	prev := m.prev
-	if prev == nil {
-		prev = nut.Status{}
-	}
 
 	// Dispatch shutdown conditions before any potentially slow informational
 	// notifications, including initial startup and communication recovery.
@@ -412,6 +423,10 @@ func (m *Monitor) diffAndEmit(ctx context.Context, snap Snapshot, cur nut.Status
 	if cur.Has("LB") && cur.Has("OB") && !(prev.Has("LB") && prev.Has("OB")) {
 		m.emit(ctx, Event{Kind: EventLowBatt, Snapshot: snap, Previous: m.last, Message: m.describe(EventLowBatt, snap)})
 	}
+}
+
+func (m *Monitor) emitOtherEdges(ctx context.Context, snap Snapshot, cur nut.Status) {
+	prev := m.prev
 	if m.commBad {
 		m.emit(ctx, Event{Kind: EventCommOK, Snapshot: snap, Previous: m.last, Message: "communication restored"})
 	}
@@ -427,7 +442,8 @@ func (m *Monitor) diffAndEmit(ctx context.Context, snap Snapshot, cur nut.Status
 	}
 	sort.Strings(tokens)
 
-	now := time.Now()
+	// Debounce measures observations; synchronous sinks may finish much later.
+	now := snap.Time
 	for _, tok := range tokens {
 		edge := tokenEdges[tok]
 		entered := cur.Has(tok) && !prev.Has(tok)

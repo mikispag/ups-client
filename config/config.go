@@ -5,7 +5,9 @@ package config
 import (
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"sort"
@@ -173,6 +175,29 @@ func (c *Config) applyDefaults() {
 }
 
 func (c *Config) validate() error {
+	address := c.NUT.Address
+	host := address
+	if strings.HasPrefix(address, "[") && strings.HasSuffix(address, "]") {
+		host = address[1 : len(address)-1]
+	}
+	if _, err := netip.ParseAddr(host); err == nil || !strings.Contains(address, ":") {
+		address = net.JoinHostPort(host, "3493")
+	}
+	host, port, err := net.SplitHostPort(address)
+	if err != nil || !validHost(host) || !validPort(port) {
+		return fmt.Errorf("nut.address: expected a host with an optional valid TCP port")
+	}
+	if c.NUT.UPS == "" {
+		return fmt.Errorf("nut.ups must not be empty")
+	}
+	for _, value := range []string{c.NUT.UPS, c.NUT.Username, c.NUT.Password} {
+		if strings.ContainsAny(value, "\r\n\x00") {
+			return fmt.Errorf("nut: UPS and credentials must not contain line breaks or NUL")
+		}
+	}
+	if c.NUT.Password != "" && c.NUT.Username == "" {
+		return fmt.Errorf("nut.username is required when password is set")
+	}
 	// Zero disables NOCOMM or debounce; polling and I/O need positive durations.
 	for _, v := range []struct {
 		name string
@@ -217,6 +242,16 @@ func (c *Config) validate() error {
 		if t.Command == "" {
 			return fmt.Errorf("shell[%d]: command is required", i)
 		}
+		for _, arg := range append([]string{t.Command}, t.Args...) {
+			if strings.ContainsRune(arg, '\x00') {
+				return fmt.Errorf("shell[%d]: command and args must not contain NUL", i)
+			}
+		}
+		for key, value := range t.Env {
+			if key == "" || strings.ContainsAny(key, "=\x00") || strings.ContainsRune(value, '\x00') {
+				return fmt.Errorf("shell[%d]: invalid environment entry", i)
+			}
+		}
 		if err := check(fmt.Sprintf("shell[%d]", i), t.Timeout, t.Events, t.Args...); err != nil {
 			return err
 		}
@@ -227,7 +262,21 @@ func (c *Config) validate() error {
 		}
 		target := fmt.Sprintf("webhook[%d]", i)
 		templates := []string{t.URL, t.Body}
-		for _, header := range t.Headers {
+		headers := make(map[string]bool, len(t.Headers))
+		for key, header := range t.Headers {
+			if !validHeaderName(key) {
+				return fmt.Errorf("%s: invalid HTTP header name", target)
+			}
+			canonical := http.CanonicalHeaderKey(key)
+			if headers[canonical] {
+				return fmt.Errorf("%s: duplicate HTTP header name (case insensitive)", target)
+			}
+			headers[canonical] = true
+			if !strings.Contains(header, "{{") && strings.IndexFunc(header, func(r rune) bool {
+				return (r < 32 && r != '\t') || r == 127
+			}) >= 0 {
+				return fmt.Errorf("%s: invalid HTTP header value", target)
+			}
 			templates = append(templates, header)
 		}
 		if err := check(target, t.Timeout, t.Events, templates...); err != nil {
@@ -246,6 +295,9 @@ func (c *Config) validate() error {
 		if t.Host == "" || t.User == "" || t.Command == "" {
 			return fmt.Errorf("ssh[%d]: host, user and command are required", i)
 		}
+		if !validHost(t.Host) {
+			return fmt.Errorf("ssh[%d]: host must be a hostname or unbracketed IP address; use port separately", i)
+		}
 		if t.Password == "" && t.PrivateKeyFile == "" {
 			return fmt.Errorf("ssh[%d]: set either password or private_key_file", i)
 		}
@@ -261,9 +313,16 @@ func (c *Config) validate() error {
 			return fmt.Errorf("telegram[%d]: bot_token and chat_id are required", i)
 		}
 		target := fmt.Sprintf("telegram[%d]", i)
+		if strings.ContainsAny(t.BotToken, "/?# \t\r\n\x00") {
+			return fmt.Errorf("%s: bot_token contains an invalid URL path character", target)
+		}
 		if t.APIBase != "" {
 			if err := validateHTTPURL(target+".api_base", t.APIBase); err != nil {
 				return err
+			}
+			u, _ := url.Parse(t.APIBase) // validateHTTPURL already parsed it.
+			if u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
+				return fmt.Errorf("%s: api_base must not contain a query or fragment", target)
 			}
 		}
 		switch t.ParseMode {
@@ -284,7 +343,35 @@ func validateHTTPURL(field, raw string) error {
 		// URLs may contain credentials; report the field without its value.
 		return fmt.Errorf("%s: expected an absolute HTTP(S) URL", field)
 	}
+	if !validHost(u.Hostname()) || (u.Port() != "" && !validPort(u.Port())) {
+		return fmt.Errorf("%s: invalid HTTP(S) host or port", field)
+	}
 	return nil
+}
+
+func validHost(host string) bool {
+	if host == "" || strings.IndexFunc(host, func(r rune) bool {
+		return r <= 32 || r == 127 || strings.ContainsRune("/\\@[]", r)
+	}) >= 0 {
+		return false
+	}
+	if strings.Contains(host, ":") {
+		_, err := netip.ParseAddr(host)
+		return err == nil
+	}
+	return true
+}
+
+func validPort(port string) bool {
+	n, err := net.LookupPort("tcp", port)
+	return err == nil && n > 0
+}
+
+func validHeaderName(name string) bool {
+	return name != "" && strings.IndexFunc(name, func(r rune) bool {
+		return !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
+			(r >= '0' && r <= '9') || strings.ContainsRune("!#$%&'*+-.^_`|~", r))
+	}) < 0
 }
 
 func allEventNames() map[string]struct{} {

@@ -83,6 +83,9 @@ func (t *SSHTarget) Match(e monitor.Event) bool { return t.Filter.Match(e.Kind) 
 func (t *SSHTarget) authMethods() ([]ssh.AuthMethod, error) {
 	var methods []ssh.AuthMethod
 	if t.PrivateKeyFile != "" {
+		if err := requireRegularFile(t.PrivateKeyFile); err != nil {
+			return nil, fmt.Errorf("read key: %w", err)
+		}
 		key, err := os.ReadFile(t.PrivateKeyFile)
 		if err != nil {
 			return nil, fmt.Errorf("read key: %w", err)
@@ -120,7 +123,23 @@ func (t *SSHTarget) hostKeyCallback() (ssh.HostKeyCallback, error) {
 		}
 		path = home + "/.ssh/known_hosts"
 	}
+	if err := requireRegularFile(path); err != nil {
+		return nil, fmt.Errorf("read known_hosts: %w", err)
+	}
 	return knownhosts.New(path)
+}
+
+// Credential reads happen before dialing and must not block on pipes or
+// devices. Stat follows symlinks so ordinary linked credentials still work.
+func requireRegularFile(path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("%q: not a regular file", path)
+	}
+	return nil
 }
 
 // Notify implements Notifier.

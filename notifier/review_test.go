@@ -228,3 +228,122 @@ func TestTelegramDefaultMessageDoesNotUseParseMode(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestShellFailedParentStillStopsDescendants(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX shell only")
+	}
+	marker := filepath.Join(t.TempDir(), "survived")
+	target := &ShellTarget{Command: "/bin/sh", Args: []string{"-c", `sh -c 'sleep 0.3; echo alive > "$1"' sh "$1" & exit 1`, "sh", marker}}
+	if err := target.Notify(context.Background(), sampleEvent(monitor.EventOnline)); err == nil {
+		t.Fatal("expected command failure")
+	}
+	time.Sleep(350 * time.Millisecond)
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Errorf("descendant survived failed parent and pipe cleanup: %v", err)
+	}
+}
+
+func TestWebhookCustomHostHeader(t *testing.T) {
+	host := make(chan string, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		host <- r.Host
+	}))
+	defer srv.Close()
+	target := &WebhookTarget{URL: srv.URL, Headers: map[string]string{"hOsT": "{{.UPS}}.example"}}
+	if err := target.Notify(context.Background(), sampleEvent(monitor.EventOnline)); err != nil {
+		t.Fatal(err)
+	}
+	if got := <-host; got != "ups.example" {
+		t.Errorf("configured Host header ignored: %q", got)
+	}
+}
+
+func TestTelegramContextErrors(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+	for _, cancelled := range []bool{false, true} {
+		t.Run(fmt.Sprint(cancelled), func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			want := context.DeadlineExceeded
+			if cancelled {
+				cancel()
+				want = context.Canceled
+			}
+			target := &TelegramTarget{BotToken: "SECRET", ChatID: "1", APIBase: srv.URL, Timeout: 20 * time.Millisecond}
+			err := target.Notify(ctx, sampleEvent(monitor.EventOnline))
+			if !errors.Is(err, want) {
+				t.Errorf("lost context error identity: %v; want %v", err, want)
+			}
+			if err != nil && strings.Contains(err.Error(), "SECRET") {
+				t.Errorf("context error leaked token: %v", err)
+			}
+		})
+	}
+}
+
+func TestWebhookHeaderErrorsHideSecrets(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer srv.Close()
+	for _, header := range []string{"Authorization", "Host"} {
+		t.Run(header, func(t *testing.T) {
+			event := sampleEvent(monitor.EventAlarm)
+			event.Snapshot.Vars["ups.alarm"] = "SECRET-CREDENTIAL\n"
+			target := &WebhookTarget{URL: srv.URL, Headers: map[string]string{header: "{{.Alarm}}"}}
+			err := target.Notify(context.Background(), event)
+			if err == nil {
+				t.Fatal("expected invalid header error")
+			}
+			if strings.Contains(err.Error(), "SECRET-CREDENTIAL") {
+				t.Errorf("invalid header error exposed secret: %v", err)
+			}
+		})
+	}
+}
+
+func TestWebhookHostAuthorities(t *testing.T) {
+	for _, tc := range []struct {
+		host  string
+		valid bool
+	}{
+		{":", false},
+		{":8080", false},
+		{"example.com,other", true},
+		{"example.com|other", false},
+		{"example.com", true},
+		{"example.com:8080", true},
+		{"[::1]", true},
+		{"[::1]:8080", true},
+	} {
+		t.Run(tc.host, func(t *testing.T) {
+			received := make(chan string, 1)
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				received <- r.Host
+			}))
+			defer srv.Close()
+			target := &WebhookTarget{URL: srv.URL, Headers: map[string]string{"Host": tc.host}}
+			err := target.Notify(context.Background(), sampleEvent(monitor.EventOnline))
+			if tc.valid {
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got := <-received; got != tc.host {
+					t.Errorf("Host changed: %q", got)
+				}
+			} else {
+				if err == nil {
+					t.Error("invalid Host accepted")
+				}
+				select {
+				case got := <-received:
+					t.Errorf("invalid Host reached server as %q", got)
+				default:
+				}
+			}
+		})
+	}
+}

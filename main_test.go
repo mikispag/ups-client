@@ -1,12 +1,15 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestCheckValidatesTLS(t *testing.T) {
@@ -34,6 +37,34 @@ func TestCheckValidatesTLS(t *testing.T) {
 				t.Fatalf("missing validation result: %s", out)
 			}
 		})
+	}
+}
+
+func TestCheckRejectsNonRegularCA(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("uses /proc file descriptors")
+	}
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	defer writer.Close()
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`nut: {tls: {enable: true, ca_file: /proc/self/fd/3}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestCheckHelper$")
+	cmd.Env = append(os.Environ(), "UPS_CLIENT_TEST_CONFIG="+path)
+	cmd.ExtraFiles = []*os.File{reader}
+	out, err := cmd.CombinedOutput()
+	if ctx.Err() != nil {
+		t.Fatal("-check blocked while reading a nonregular CA file")
+	}
+	if err == nil || !strings.Contains(string(out), "regular file") {
+		t.Fatalf("expected nonregular CA rejection, got %v: %s", err, out)
 	}
 }
 

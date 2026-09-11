@@ -228,7 +228,7 @@ CLI flags:
 
 ## Configuration
 
-Omitted durations use their defaults. Explicit `0s` disables NOCOMM or debounce; polling and NUT I/O durations must be positive. Notifier timeouts default to 10s. Validation checks template syntax without executing commands or contacting endpoints; runtime-only errors and SSH key/trust-file access are checked on delivery.
+Omitted durations use their defaults. Explicit `0s` disables NOCOMM or debounce; polling and NUT I/O durations must be positive. Notifier timeouts default to 10s. Validation checks template syntax, literal addresses, environment entries, and HTTP headers without executing commands or contacting endpoints; runtime-only errors and SSH key/trust-file access are checked on delivery.
 
 YAML; see [`ups-client.example.yaml`](./ups-client.example.yaml) for a complete sample. Top-level keys: `nut`, `monitor`, `notifications`.
 
@@ -248,7 +248,7 @@ nut:
     insecure_skip_verify: false
 ```
 
-When `server_name` is omitted, TLS verifies the host from `nut.address`.
+When `server_name` is omitted, TLS verifies the host from `nut.address`. CA certificates and SSH key/known-hosts paths must refer to regular files; symlinks to regular files are supported.
 
 ### `monitor`
 
@@ -352,6 +352,8 @@ shell:
 The child process inherits your environment plus `UPS_*` variables: `UPS_EVENT`, `UPS_NAME`, `UPS_STATUS`, `UPS_PREVIOUS_STATUS`, `UPS_BATTERY_CHARGE`, `UPS_BATTERY_RUNTIME`, `UPS_INPUT_VOLTAGE`, `UPS_OUTPUT_VOLTAGE`, `UPS_LOAD`, `UPS_DEVICE_MODEL`, `UPS_DEVICE_SERIAL`, `UPS_TIMESTAMP`. The optional per-target `env:` map adds extra keys.
 
 #### Webhook (and ntfy)
+
+A configured `Host` header overrides the HTTP virtual host while the URL still selects the connection endpoint. Header names must be unique regardless of case.
 
 ```yaml
 webhook:
@@ -523,7 +525,7 @@ Everything else (`Protect{KernelTunables,KernelModules,ControlGroups}`, `Restric
 
 ### Low-battery shutdown without sudo
 
-The example config runs `systemctl --no-block poweroff` on `LOWBATT` (both `OB` and `LB` asserted) or `FSD`. A read-only driver + upsd deployment normally needs the `LOWBATT` trigger: a primary upsmon usually sets `FSD`, and this client does not issue that command or coordinate UPS output cutoff. For coordinated shutdown across multiple hosts, run a primary upsmon and use `FSD` as appropriate. See the [NUT shutdown workflow](https://networkupstools.org/docs/man/upsmon.html). The `ups-client` system user can't trigger a poweroff by default — logind's polkit policy requires an active local session, which a daemon doesn't have. The repo ships a tiny polkit rule that grants exactly the `power-off` / `halt` actions to the `ups-client` user only:
+The example config runs `systemctl --no-block --check-inhibitors=no poweroff` on `LOWBATT` (both `OB` and `LB` asserted) or `FSD`. A read-only driver + upsd deployment normally needs the `LOWBATT` trigger: a primary upsmon usually sets `FSD`, and this client does not issue that command or coordinate UPS output cutoff. For coordinated shutdown across multiple hosts, run a primary upsmon and use `FSD` as appropriate. See the [NUT shutdown workflow](https://networkupstools.org/docs/man/upsmon.html). The `ups-client` system user can't trigger a poweroff by default — logind's polkit policy requires an active local session, which a daemon doesn't have. The repo ships a polkit rule that grants power-off and halt actions, including overrides for logged-in users and shutdown inhibitors, to the `ups-client` user only. Emergency shutdown must proceed before battery exhaustion even if another application holds an inhibitor. See [systemd inhibitor handling](https://github.com/systemd/systemd/blob/main/man/systemctl.xml). Reinstall the rule and update the command when upgrading an existing deployment:
 
 ```bash
 sudo install -m 0644 init/ups-client-poweroff.rules \
@@ -533,7 +535,7 @@ sudo install -m 0644 init/ups-client-poweroff.rules \
 Polkit picks the rule up immediately — no daemon reload. After this:
 
 ```bash
-sudo -u ups-client systemctl --no-block poweroff   # would actually power off the box
+sudo -u ups-client systemctl --no-block --check-inhibitors=no poweroff   # would actually power off the box
 ```
 
 Skip this step if you don't want ups-client to be able to trigger a shutdown — you can drop the `poweroff` block from the shell notifier list, and `FSD` will still trigger every other configured channel (ntfy, Telegram, …).

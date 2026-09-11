@@ -213,3 +213,51 @@ func TestExampleConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestParseRejectsInvalidTransportSettings(t *testing.T) {
+	cases := map[string]string{
+		"duplicate HTTP header":     `notifications: {webhook: [{url: "https://example.com", headers: {Authorization: first, authorization: second}}]}`,
+		"empty NUT address":         `nut: {address: ""}`,
+		"missing NUT host":          `nut: {address: ":3493"}`,
+		"invalid NUT port":          `nut: {address: "localhost:65536"}`,
+		"invalid NUT host":          `nut: {address: "http://localhost:3493"}`,
+		"empty UPS":                 `nut: {ups: ""}`,
+		"NUT protocol delimiter":    `nut: {password: "secret\nLOGOUT"}`,
+		"password without username": `nut: {password: secret}`,
+		"shell command NUL":         `notifications: {shell: [{command: "true\0"}]}`,
+		"shell argument NUL":        `notifications: {shell: [{command: /bin/true, args: ["a\0b"]}]}`,
+		"shell environment name":    `notifications: {shell: [{command: /bin/true, env: {"A=B": value}}]}`,
+		"shell environment NUL":     `notifications: {shell: [{command: /bin/true, env: {A: "a\0b"}}]}`,
+		"webhook port":              `notifications: {webhook: [{url: "https://example.com:65536/path"}]}`,
+		"webhook header name":       `notifications: {webhook: [{url: "https://example.com", headers: {"Bad Header": value}}]}`,
+		"webhook header value":      `notifications: {webhook: [{url: "https://example.com", headers: {Authorization: "secret\r\nInjected: value"}}]}`,
+		"SSH embedded port":         `notifications: {ssh: [{host: "example.com:22", user: u, password: p, command: c}]}`,
+		"Telegram query":            `notifications: {telegram: [{bot_token: T, chat_id: C, api_base: "https://example.com?key=secret"}]}`,
+		"Telegram fragment":         `notifications: {telegram: [{bot_token: T, chat_id: C, api_base: "https://example.com#fragment"}]}`,
+		"Telegram token delimiter":  `notifications: {telegram: [{bot_token: "T/secret", chat_id: C}]}`,
+	}
+	for name, src := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := Parse([]byte(src))
+			if err == nil {
+				t.Fatal("expected invalid transport settings to fail validation")
+			}
+			if strings.Contains(err.Error(), "secret") {
+				t.Fatalf("validation error leaked a credential: %v", err)
+			}
+		})
+	}
+}
+
+func TestParseValidTransportSettings(t *testing.T) {
+	for _, address := range []string{"localhost", "127.0.0.1:3493", "::1", "[::1]", "[::1]:3493", "[fe80::1%eth0]:3493"} {
+		t.Run(address, func(t *testing.T) {
+			if _, err := Parse([]byte("nut: {address: '" + address + "'}")); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+	if _, err := Parse([]byte(`notifications: {ssh: [{host: "::1", user: u, password: p, command: c}], webhook: [{url: "https://example.com:8443", headers: {Title: "{{if .Alarm}}Alert\n{{end}}"}}]}`)); err != nil {
+		t.Fatal(err)
+	}
+}
