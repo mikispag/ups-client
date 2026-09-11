@@ -14,10 +14,10 @@ jobs:
     name: Build & test (Linux)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           # Exercise the minimum supported Go series with its security patches.
           go-version: '1.26.x'
