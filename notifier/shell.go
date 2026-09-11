@@ -2,6 +2,7 @@ package notifier
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -49,20 +50,32 @@ func (t *ShellTarget) Notify(ctx context.Context, e monitor.Event) error {
 		args = append(args, rendered)
 	}
 
-	if t.Timeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, t.Timeout)
-		defer cancel()
+	timeout := t.Timeout
+	if timeout <= 0 {
+		timeout = 10 * time.Second
 	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 
 	cmd := exec.CommandContext(ctx, t.Command, args...)
+	configureShellCancellation(cmd)
+	cmd.WaitDelay = 100 * time.Millisecond
 	cmd.Env = append(os.Environ(), td.Env()...)
 	for k, v := range t.Env {
 		cmd.Env = append(cmd.Env, k+"="+v)
 	}
-	out, err := cmd.CombinedOutput()
+	var out limitedOutput
+	cmd.Stdout, cmd.Stderr = &out, &out
+	err := cmd.Run()
+	if errors.Is(err, exec.ErrWaitDelay) {
+		// The direct child exited, but descendants still own its output pipes.
+		_ = cmd.Cancel()
+	}
 	if err != nil {
-		return fmt.Errorf("%s: %w (output: %s)", t.Name(), err, string(out))
+		if ctx.Err() != nil {
+			err = ctx.Err()
+		}
+		return fmt.Errorf("%s: %w (output: %s)", t.Name(), err, out.String())
 	}
 	return nil
 }

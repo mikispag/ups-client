@@ -4,10 +4,13 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mikispag/ups-client/monitor"
@@ -27,7 +30,8 @@ type WebhookTarget struct {
 	InsecureSkipVerify bool
 	Filter             Filter
 
-	client *http.Client
+	client     *http.Client
+	clientOnce sync.Once
 }
 
 // Name implements Notifier.
@@ -35,7 +39,11 @@ func (t *WebhookTarget) Name() string {
 	if t.Label != "" {
 		return "webhook:" + t.Label
 	}
-	return "webhook:" + t.URL
+	u, err := url.Parse(t.URL)
+	if err != nil {
+		return "webhook:unnamed"
+	}
+	return "webhook:" + u.Host
 }
 
 // Match implements Notifier.
@@ -47,6 +55,10 @@ func (t *WebhookTarget) Notify(ctx context.Context, e monitor.Event) error {
 		return fmt.Errorf("webhook %q: empty URL", t.Label)
 	}
 	td := NewTemplateData(e)
+	endpoint, err := renderTemplate(t.Name()+".url", t.URL, td)
+	if err != nil {
+		return err
+	}
 
 	method := strings.ToUpper(strings.TrimSpace(t.Method))
 	if method == "" {
@@ -79,9 +91,9 @@ func (t *WebhookTarget) Notify(ctx context.Context, e monitor.Event) error {
 		defer cancel()
 	}
 
-	req, err := http.NewRequestWithContext(ctx, method, t.URL, body)
+	req, err := http.NewRequestWithContext(ctx, method, endpoint, body)
 	if err != nil {
-		return err
+		return t.requestError(err)
 	}
 	if contentType != "" && req.Header.Get("Content-Type") == "" {
 		req.Header.Set("Content-Type", contentType)
@@ -97,28 +109,43 @@ func (t *WebhookTarget) Notify(ctx context.Context, e monitor.Event) error {
 	client := t.httpClient()
 	resp, err := client.Do(req)
 	if err != nil {
-		return err
+		return t.requestError(err)
 	}
 	defer resp.Body.Close()
-	io.Copy(io.Discard, resp.Body)
-	if resp.StatusCode >= 400 {
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("%s: HTTP %d", t.Name(), resp.StatusCode)
+	}
+	if _, err := io.Copy(io.Discard, io.LimitReader(resp.Body, maxResponseBytes)); err != nil {
+		return fmt.Errorf("%s: read response: %w", t.Name(), err)
 	}
 	return nil
 }
 
 func (t *WebhookTarget) httpClient() *http.Client {
-	if t.client != nil {
-		return t.client
-	}
-	timeout := t.Timeout
-	if timeout <= 0 {
-		timeout = 10 * time.Second
-	}
-	tr := http.DefaultTransport.(*http.Transport).Clone()
-	if t.InsecureSkipVerify {
-		tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //#nosec G402 — opt-in only
-	}
-	t.client = &http.Client{Transport: tr, Timeout: timeout}
+	t.clientOnce.Do(func() {
+		if t.client != nil {
+			return
+		}
+		timeout := t.Timeout
+		if timeout <= 0 {
+			timeout = 10 * time.Second
+		}
+		tr := http.DefaultTransport.(*http.Transport).Clone()
+		if t.InsecureSkipVerify {
+			tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //#nosec G402 — opt-in only
+		}
+		t.client = &http.Client{Transport: tr, Timeout: timeout, CheckRedirect: rejectRedirect}
+	})
 	return t.client
+}
+
+func rejectRedirect(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+
+// URL paths and query strings commonly contain webhook credentials.
+func (t *WebhookTarget) requestError(err error) error {
+	var uerr *url.Error
+	if errors.As(err, &uerr) {
+		err = uerr.Err
+	}
+	return fmt.Errorf("%s: %w", t.Name(), err)
 }

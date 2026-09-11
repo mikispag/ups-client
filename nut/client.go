@@ -19,8 +19,11 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
+	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -28,11 +31,15 @@ import (
 const DefaultPort = 3493
 
 // Client is a single multiplexed connection to a NUT upsd instance. It is not
-// safe for concurrent use; serialize calls or open multiple connections.
+// safe for concurrent use except Close; serialize commands or open multiple connections.
 type Client struct {
-	conn    net.Conn
-	rd      *bufio.Reader
-	timeout time.Duration
+	conn       net.Conn
+	rd         *bufio.Reader
+	writer     io.Writer
+	timeout    time.Duration
+	serverName string
+	closeOnce  sync.Once
+	closeErr   error
 }
 
 // Var is a single (ups, name, value) tuple as returned by GET VAR / LIST VAR.
@@ -53,7 +60,7 @@ func (e *ProtocolError) Error() string { return "NUT error: " + e.Code }
 func (e *ProtocolError) Is(target error) bool {
 	var pe *ProtocolError
 	if errors.As(target, &pe) {
-		return pe.Code == e.Code
+		return pe != nil && pe.Code == e.Code
 	}
 	return false
 }
@@ -67,9 +74,8 @@ func IsTransient(err error) bool {
 	}
 	var pe *ProtocolError
 	if errors.As(err, &pe) {
-		switch {
-		case strings.HasPrefix(pe.Code, "DATA-STALE"),
-			strings.HasPrefix(pe.Code, "DRIVER-NOT-CONNECTED"):
+		switch pe.Code {
+		case "DATA-STALE", "DRIVER-NOT-CONNECTED":
 			return true
 		}
 		return false
@@ -80,30 +86,34 @@ func IsTransient(err error) bool {
 }
 
 // Dial opens a TCP connection to a NUT server. If addr lacks a port, 3493 is
-// appended. timeout applies to each individual read/write deadline; pass 0
-// to disable deadlines.
+// appended. timeout bounds dialing and each complete command/response exchange;
+// pass 0 to disable deadlines.
 func Dial(ctx context.Context, addr string, timeout time.Duration) (*Client, error) {
-	if !strings.Contains(addr, ":") || strings.HasSuffix(addr, "]") {
-		addr = fmt.Sprintf("%s:%d", addr, DefaultPort)
+	host := strings.TrimSuffix(strings.TrimPrefix(addr, "["), "]")
+	if _, err := netip.ParseAddr(host); err == nil || !strings.Contains(addr, ":") {
+		addr = net.JoinHostPort(host, fmt.Sprint(DefaultPort))
+	}
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, err
 	}
 	d := &net.Dialer{Timeout: timeout}
 	conn, err := d.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return nil, err
 	}
-	return &Client{conn: conn, rd: bufio.NewReader(conn), timeout: timeout}, nil
+	return &Client{conn: conn, rd: bufio.NewReader(conn), timeout: timeout, serverName: host}, nil
 }
 
-// Close politely sends LOGOUT and tears down the TCP connection. The first
-// non-nil error encountered is returned.
+// Close tears down the TCP connection, interrupting any pending operation.
+// It is safe to call concurrently with other methods and is idempotent.
 func (c *Client) Close() error {
-	if c.conn == nil {
-		return nil
-	}
-	_, _ = c.writeLine("LOGOUT")
-	err := c.conn.Close()
-	c.conn = nil
-	return err
+	c.closeOnce.Do(func() {
+		if c.conn != nil {
+			c.closeErr = c.conn.Close()
+		}
+	})
+	return c.closeErr
 }
 
 func (c *Client) setDeadlines() {
@@ -113,21 +123,79 @@ func (c *Client) setDeadlines() {
 }
 
 func (c *Client) writeLine(line string) (int, error) {
+	if err := validateArguments(line); err != nil {
+		return 0, err
+	}
+	if c.conn == nil {
+		return 0, net.ErrClosed
+	}
 	c.setDeadlines()
-	return c.conn.Write([]byte(line + "\n"))
+	writer := c.writer
+	if writer == nil {
+		writer = c.conn
+	}
+	n, err := writer.Write([]byte(line + "\n"))
+	if err == nil && n != len(line)+1 {
+		err = io.ErrShortWrite
+	}
+	return n, err
 }
 
 func (c *Client) readLine() (string, error) {
-	c.setDeadlines()
-	line, err := c.rd.ReadString('\n')
-	if err != nil {
-		// Surface a clean EOF rather than a partial-line truncation.
-		if errors.Is(err, io.EOF) && line == "" {
-			return "", io.EOF
+	var buf []byte
+	for {
+		part, err := c.rd.ReadSlice('\n')
+		if len(buf)+len(part) > 64*1024 {
+			return "", fmt.Errorf("nut: response line exceeds 64 KiB")
 		}
-		return strings.TrimRight(line, "\r\n"), err
+		buf = append(buf, part...)
+		if errors.Is(err, bufio.ErrBufferFull) {
+			continue
+		}
+		if err != nil {
+			return "", err
+		}
+		break
 	}
-	return strings.TrimRight(line, "\r\n"), nil
+	line := strings.TrimSuffix(strings.TrimSuffix(string(buf), "\n"), "\r")
+	if err := validateArguments(line); err != nil {
+		return "", err
+	}
+	fields := strings.Fields(line)
+	if len(fields) > 0 && fields[0] == "ERR" {
+		if len(fields) < 2 {
+			return "", fmt.Errorf("nut: malformed error response")
+		}
+		return line, &ProtocolError{Code: fields[1]}
+	}
+	return line, nil
+}
+
+func validateArguments(args ...string) error {
+	for _, arg := range args {
+		if strings.ContainsAny(arg, "\r\n\x00") {
+			return fmt.Errorf("nut: argument contains a line break or NUL")
+		}
+	}
+	return nil
+}
+
+func wireToken(s string) string {
+	if s == "" || strings.ContainsAny(s, " \t\"\\") {
+		return Quote(s)
+	}
+	return s
+}
+
+func (c *Client) commandOK(cmd, want string) error {
+	line, err := c.command(cmd)
+	if err != nil {
+		return err
+	}
+	if line != want {
+		return fmt.Errorf("nut: unexpected response %q (want %q)", line, want)
+	}
+	return nil
 }
 
 // command sends one line and reads exactly one OK/ERR-shaped reply.
@@ -138,14 +206,6 @@ func (c *Client) command(cmd string) (string, error) {
 	line, err := c.readLine()
 	if err != nil {
 		return line, err
-	}
-	if strings.HasPrefix(line, "ERR ") {
-		fields := strings.Fields(strings.TrimPrefix(line, "ERR "))
-		code := ""
-		if len(fields) > 0 {
-			code = fields[0]
-		}
-		return line, &ProtocolError{Code: code}
 	}
 	return line, nil
 }
@@ -159,17 +219,20 @@ func (c *Client) command(cmd string) (string, error) {
 // characters in either are passed through as a single token rather than
 // frame-shifting the parser.
 func (c *Client) Login(username, password, ups string) error {
+	if err := validateArguments(username, password, ups); err != nil {
+		return err
+	}
 	if username == "" && password == "" {
 		return nil
 	}
-	if _, err := c.command("USERNAME " + Quote(username)); err != nil {
+	if err := c.commandOK("USERNAME "+Quote(username), "OK"); err != nil {
 		return err
 	}
-	if _, err := c.command("PASSWORD " + Quote(password)); err != nil {
+	if err := c.commandOK("PASSWORD "+Quote(password), "OK"); err != nil {
 		return err
 	}
 	if ups != "" {
-		if _, err := c.command("LOGIN " + ups); err != nil {
+		if err := c.commandOK("LOGIN "+wireToken(ups), "OK"); err != nil {
 			return err
 		}
 	}
@@ -180,38 +243,64 @@ func (c *Client) Login(username, password, ups string) error {
 // support (OpenSSL/NSS) and have CERTFILE configured; otherwise it returns
 // ProtocolError{Code: "FEATURE-NOT-CONFIGURED"}.
 func (c *Client) StartTLS(cfg *tls.Config) error {
-	if _, err := c.command("STARTTLS"); err != nil {
+	return c.StartTLSContext(context.Background(), cfg)
+}
+
+// StartTLSContext upgrades the connection and closes it if ctx is canceled
+// during negotiation. An empty ServerName is inferred from the dial address.
+// A nil cfg uses the system trust store and standard TLS defaults.
+func (c *Client) StartTLSContext(ctx context.Context, cfg *tls.Config) error {
+	if err := ctx.Err(); err != nil {
 		return err
+	}
+	stop := context.AfterFunc(ctx, func() { _ = c.Close() })
+	defer stop()
+	if err := c.commandOK("STARTTLS", "OK STARTTLS"); err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return err
+	}
+	if cfg == nil {
+		cfg = &tls.Config{}
+	} else {
+		cfg = cfg.Clone()
+	}
+	if cfg.ServerName == "" {
+		cfg.ServerName = c.serverName
+		if addr, err := netip.ParseAddr(cfg.ServerName); err == nil {
+			cfg.ServerName = addr.WithZone("").String()
+		}
+	}
+	if c.rd.Buffered() != 0 {
+		_ = c.Close()
+		return fmt.Errorf("nut: unexpected plaintext after STARTTLS acknowledgment")
 	}
 	tlsConn := tls.Client(c.conn, cfg)
-	if err := tlsConn.HandshakeContext(context.Background()); err != nil {
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
+		_ = c.Close()
 		return err
 	}
-	c.conn = tlsConn
+	c.writer = tlsConn
 	c.rd = bufio.NewReader(tlsConn)
 	return nil
 }
 
 // GetVar issues `GET VAR <ups> <name>` and returns the unquoted value.
 func (c *Client) GetVar(ups, name string) (string, error) {
-	if _, err := c.writeLine(fmt.Sprintf("GET VAR %s %s", ups, name)); err != nil {
+	if _, err := c.writeLine(fmt.Sprintf("GET VAR %s %s", wireToken(ups), wireToken(name))); err != nil {
 		return "", err
 	}
 	line, err := c.readLine()
 	if err != nil {
 		return "", err
 	}
-	if strings.HasPrefix(line, "ERR ") {
-		fields := strings.Fields(strings.TrimPrefix(line, "ERR "))
-		code := ""
-		if len(fields) > 0 {
-			code = fields[0]
-		}
-		return "", &ProtocolError{Code: code}
-	}
 	v, err := parseVarLine(line)
 	if err != nil {
 		return "", err
+	}
+	if v.UPS != ups || v.Name != name {
+		return "", fmt.Errorf("nut: response does not match requested variable: %q", line)
 	}
 	return v.Value, nil
 }
@@ -220,10 +309,14 @@ func (c *Client) GetVar(ups, name string) (string, error) {
 // (variable name → unquoted value).
 func (c *Client) ListVars(ups string) (map[string]string, error) {
 	out := make(map[string]string)
-	err := c.list("LIST VAR "+ups, "BEGIN LIST VAR "+ups, "END LIST VAR "+ups, func(line string) error {
+	token := wireToken(ups)
+	err := c.list("LIST VAR "+token, "BEGIN LIST VAR "+token, "END LIST VAR "+token, func(line string) error {
 		v, perr := parseVarLine(line)
 		if perr != nil {
-			return nil // skip stray non-VAR lines rather than aborting
+			return perr
+		}
+		if v.UPS != ups {
+			return fmt.Errorf("nut: response does not match requested UPS: %q", line)
 		}
 		out[v.Name] = v.Value
 		return nil
@@ -238,17 +331,11 @@ func (c *Client) ListVars(ups string) (map[string]string, error) {
 func (c *Client) ListUPS() (map[string]string, error) {
 	out := make(map[string]string)
 	err := c.list("LIST UPS", "BEGIN LIST UPS", "END LIST UPS", func(line string) error {
-		if !strings.HasPrefix(line, "UPS ") {
-			return nil
+		fields, err := parseTokens(line)
+		if err != nil || len(fields) != 3 || fields[0] != "UPS" || fields[1] == "" {
+			return fmt.Errorf("nut: malformed UPS line: %q", line)
 		}
-		rest := strings.TrimPrefix(line, "UPS ")
-		sp := strings.IndexByte(rest, ' ')
-		if sp < 0 {
-			out[rest] = ""
-			return nil
-		}
-		name := rest[:sp]
-		out[name] = unquote(strings.TrimSpace(rest[sp+1:]))
+		out[fields[1]] = fields[2]
 		return nil
 	})
 	if err != nil {
@@ -265,32 +352,23 @@ func (c *Client) list(cmd, beginPrefix, endPrefix string, onLine func(string) er
 	if err != nil {
 		return err
 	}
-	if strings.HasPrefix(first, "ERR ") {
-		fields := strings.Fields(strings.TrimPrefix(first, "ERR "))
-		code := ""
-		if len(fields) > 0 {
-			code = fields[0]
-		}
-		return &ProtocolError{Code: code}
-	}
-	if !strings.HasPrefix(first, beginPrefix) {
+	if !sameTokens(first, beginPrefix) {
 		return fmt.Errorf("nut: unexpected response %q (want %q)", first, beginPrefix)
 	}
+	// Include a CRLF allowance for each line, even when the server uses LF.
+	responseBytes := len(first) + 2
 	for {
 		line, err := c.readLine()
 		if err != nil {
 			return err
 		}
-		if strings.HasPrefix(line, endPrefix) {
-			return nil
+		responseBytes += len(line) + 2
+		if responseBytes > 1<<20 {
+			_ = c.Close()
+			return fmt.Errorf("nut: LIST response exceeds 1 MiB")
 		}
-		if strings.HasPrefix(line, "ERR ") {
-			fields := strings.Fields(strings.TrimPrefix(line, "ERR "))
-			code := ""
-			if len(fields) > 0 {
-				code = fields[0]
-			}
-			return &ProtocolError{Code: code}
+		if sameTokens(line, endPrefix) {
+			return nil
 		}
 		if err := onLine(line); err != nil {
 			return err
@@ -331,22 +409,51 @@ func (s Status) String() string { return strings.Join(s.Tokens(), " ") }
 
 // parseVarLine parses `VAR <ups> <name> "<value>"`.
 func parseVarLine(line string) (Var, error) {
-	if !strings.HasPrefix(line, "VAR ") {
-		return Var{}, fmt.Errorf("nut: not a VAR line: %q", line)
-	}
-	rest := strings.TrimPrefix(line, "VAR ")
-	sp1 := strings.IndexByte(rest, ' ')
-	if sp1 < 0 {
+	fields, err := parseTokens(line)
+	if err != nil || len(fields) != 4 || fields[0] != "VAR" || fields[1] == "" || fields[2] == "" {
 		return Var{}, fmt.Errorf("nut: malformed VAR line: %q", line)
 	}
-	ups := rest[:sp1]
-	rest = rest[sp1+1:]
-	sp2 := strings.IndexByte(rest, ' ')
-	if sp2 < 0 {
-		return Var{}, fmt.Errorf("nut: malformed VAR line: %q", line)
+	return Var{UPS: fields[1], Name: fields[2], Value: fields[3]}, nil
+}
+
+func sameTokens(a, b string) bool {
+	x, err := parseTokens(a)
+	if err != nil {
+		return false
 	}
-	name := rest[:sp2]
-	return Var{UPS: ups, Name: name, Value: unquote(strings.TrimSpace(rest[sp2+1:]))}, nil
+	y, err := parseTokens(b)
+	return err == nil && slices.Equal(x, y)
+}
+
+func parseTokens(line string) ([]string, error) {
+	var fields []string
+	for line = strings.TrimSpace(line); line != ""; line = strings.TrimSpace(line) {
+		i := 0
+		if line[0] == '"' {
+			for i = 1; i < len(line) && line[i] != '"'; i++ {
+				if line[i] == '\\' {
+					i++
+				}
+			}
+			if i >= len(line) {
+				return nil, fmt.Errorf("nut: unterminated quoted token")
+			}
+			i++
+			if i < len(line) && line[i] != ' ' && line[i] != '\t' {
+				return nil, fmt.Errorf("nut: missing token separator")
+			}
+		} else {
+			for i < len(line) && line[i] != ' ' && line[i] != '\t' {
+				if line[i] == '"' || line[i] == '\\' {
+					return nil, fmt.Errorf("nut: malformed bare token")
+				}
+				i++
+			}
+		}
+		fields = append(fields, unquote(line[:i]))
+		line = line[i:]
+	}
+	return fields, nil
 }
 
 // unquote parses a NUT-quoted token: surrounding `"` and `\\`/`\"` escapes.

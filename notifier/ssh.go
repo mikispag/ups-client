@@ -60,8 +60,13 @@ func (r realSSHClient) Close() error { return r.c.Close() }
 
 type realSSHSession struct{ s *ssh.Session }
 
-func (r realSSHSession) CombinedOutput(cmd string) ([]byte, error) { return r.s.CombinedOutput(cmd) }
-func (r realSSHSession) Close() error                              { return r.s.Close() }
+func (r realSSHSession) CombinedOutput(cmd string) ([]byte, error) {
+	var out limitedOutput
+	r.s.Stdout, r.s.Stderr = &out, &out
+	err := r.s.Run(cmd)
+	return []byte(out.String()), err
+}
+func (r realSSHSession) Close() error { return r.s.Close() }
 
 // Name implements Notifier.
 func (t *SSHTarget) Name() string {
@@ -148,6 +153,8 @@ func (t *SSHTarget) Notify(ctx context.Context, e monitor.Event) error {
 	if timeout <= 0 {
 		timeout = 10 * time.Second
 	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 	cfg := &ssh.ClientConfig{
 		User:            t.User,
 		Auth:            auth,
@@ -169,12 +176,9 @@ func (t *SSHTarget) Notify(ctx context.Context, e monitor.Event) error {
 			if err != nil {
 				return nil, err
 			}
-			// `cfg.Timeout` only bounds the TCP leg per the x/crypto/ssh
-			// docs. Mirror what `ssh.Dial` does internally and bound the
-			// handshake with a read deadline so a peer that accepts TCP
-			// but stalls on the SSH banner cannot wedge us indefinitely.
-			if cfg.Timeout > 0 {
-				_ = nconn.SetReadDeadline(time.Now().Add(cfg.Timeout))
+			// Bound both reads and writes through the handshake and session.
+			if deadline, ok := ctx.Deadline(); ok {
+				_ = nconn.SetDeadline(deadline)
 			}
 			// Cancel the handshake on ctx cancel by closing the underlying
 			// TCP socket — `ssh.NewClientConn` does not accept a context.
@@ -185,9 +189,6 @@ func (t *SSHTarget) Notify(ctx context.Context, e monitor.Event) error {
 				_ = nconn.Close()
 				return nil, err
 			}
-			// Clear the read deadline so the session is not truncated
-			// mid-command.
-			_ = nconn.SetReadDeadline(time.Time{})
 			return realSSHClient{c: ssh.NewClient(cliConn, chans, reqs)}, nil
 		}
 	}
@@ -236,6 +237,9 @@ func (t *SSHTarget) Notify(ctx context.Context, e monitor.Event) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	case r := <-ch:
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		if r.err != nil {
 			return fmt.Errorf("%s: %w (output: %s)", t.Name(), r.err, string(r.out))
 		}

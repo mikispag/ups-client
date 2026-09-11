@@ -3,6 +3,9 @@ package monitor
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -15,13 +18,15 @@ import (
 // listVars is returned for every ListVars call. If failGet is non-nil, it is
 // returned instead of the next status.
 type fakeConn struct {
-	mu        sync.Mutex
-	statusSeq []string
-	idx       int
-	listVars  map[string]string
-	failGet   error
-	failList  error
-	closed    bool
+	mu         sync.Mutex
+	statusSeq  []string
+	idx        int
+	listVars   map[string]string
+	failGet    error
+	failList   error
+	failAlarm  error
+	omitStatus bool
+	closed     bool
 }
 
 func (f *fakeConn) GetVar(ups, name string) (string, error) {
@@ -32,7 +37,7 @@ func (f *fakeConn) GetVar(ups, name string) (string, error) {
 		return "", err
 	}
 	if name != "ups.status" {
-		return f.listVars[name], nil
+		return f.listVars[name], f.failAlarm
 	}
 	if len(f.statusSeq) == 0 {
 		return "OL", nil
@@ -58,10 +63,18 @@ func (f *fakeConn) ListVars(ups string) (map[string]string, error) {
 	if len(f.statusSeq) > 0 {
 		out["ups.status"] = f.statusSeq[0]
 	}
+	if f.omitStatus {
+		delete(out, "ups.status")
+	}
 	return out, nil
 }
 
-func (f *fakeConn) Close() error { f.closed = true; return nil }
+func (f *fakeConn) Close() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.closed = true
+	return nil
+}
 
 // recordingSink stores every event for later inspection.
 type recordingSink struct {
@@ -126,11 +139,11 @@ func TestMonitorEmitsStartup(t *testing.T) {
 
 func TestMonitorOnBattLowBattOnline(t *testing.T) {
 	m, rs, _ := newMonitorWithStatus(t,
-		"OL",                // initial connect
-		"OL",                // first poll: no change
-		"OB DISCHRG",        // power loss
-		"OB DISCHRG LB",     // low battery
-		"OL CHRG",           // power restored, charging
+		"OL",            // initial connect
+		"OL",            // first poll: no change
+		"OB DISCHRG",    // power loss
+		"OB DISCHRG LB", // low battery
+		"OL CHRG",       // power restored, charging
 	)
 	runFor(t, m, 5)
 
@@ -395,4 +408,281 @@ func containsInOrder(haystack, needle []EventKind) bool {
 		}
 	}
 	return i == len(needle)
+}
+
+func TestMonitorInitialFaults(t *testing.T) {
+	m, rs, _ := newMonitorWithStatus(t, "OB LB FSD BYPASS OVER OFF RB ALARM")
+	if err := m.tryConnect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for _, kind := range []EventKind{EventStartup, EventOnBatt, EventLowBatt, EventFSD, EventBypass, EventOverload, EventOff, EventReplBatt, EventAlarm} {
+		if !slices.Contains(rs.Kinds(), kind) {
+			t.Errorf("initial fault %s missing from %v", kind, rs.Kinds())
+		}
+	}
+}
+
+func TestMonitorBulkRefreshDetectsTransitions(t *testing.T) {
+	m, rs, fc := newMonitorWithStatus(t, "OL")
+	ctx := context.Background()
+	if err := m.tryConnect(ctx); err != nil {
+		t.Fatal(err)
+	}
+	fc.statusSeq = []string{"OB LB"}
+	if err := m.refreshVars(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !containsInOrder(rs.Kinds(), []EventKind{EventLowBatt, EventOnBatt}) {
+		t.Errorf("bulk refresh lost fault: %v", rs.Kinds())
+	}
+	if m.last.Status != "OB LB" || !slices.Equal(m.last.Tokens, []string{"LB", "OB"}) {
+		t.Errorf("inconsistent snapshot: %+v", m.last)
+	}
+	fc.statusSeq = []string{"OL"}
+	if err := m.pollStatus(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !containsInOrder(rs.Kinds(), []EventKind{EventOnBatt, EventOnline}) {
+		t.Errorf("lost recovery after bulk refresh: %v", rs.Kinds())
+	}
+	for _, e := range rs.events {
+		if e.Kind == EventOnBatt && e.Previous.Status != "OL" {
+			t.Errorf("incorrect previous status: %q", e.Previous.Status)
+		}
+	}
+}
+
+func TestMonitorConfirmedAlarmsAcrossReconnect(t *testing.T) {
+	for _, after := range []string{"OL", "OL ALARM RB"} {
+		t.Run(after, func(t *testing.T) {
+			m, rs, fc := newMonitorWithStatus(t, "OL ALARM RB")
+			ctx := context.Background()
+			if err := m.tryConnect(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if err := m.pollStatus(ctx); err != nil {
+				t.Fatal(err)
+			}
+			m.handleConnErr(ctx, "status", io.EOF)
+			fc.statusSeq = []string{after}
+			if err := m.tryConnect(ctx); err != nil {
+				t.Fatal(err)
+			}
+			counts := make(map[EventKind]int)
+			for _, e := range rs.events {
+				counts[e.Kind]++
+			}
+			if counts[EventAlarm] != 1 || counts[EventReplBatt] != 1 {
+				t.Errorf("reconnect repeated confirmed faults: %v", rs.Kinds())
+			}
+			if after == "OL" && counts[EventNotAlarm] != 1 {
+				t.Errorf("lost alarm recovery during outage: %v", rs.Kinds())
+			}
+		})
+	}
+}
+
+func TestMonitorProtocolFailureMarksCommBad(t *testing.T) {
+	m, rs, _ := newMonitorWithStatus(t, "OL")
+	ctx := context.Background()
+	m.handleConnErr(ctx, "status", &nut.ProtocolError{Code: "ACCESS-DENIED"})
+	if !slices.Contains(rs.Kinds(), EventCommBad) {
+		t.Fatalf("failure left monitor apparently healthy: %v", rs.Kinds())
+	}
+	if rs.events[0].Snapshot.UPS != "ups" {
+		t.Errorf("communication event has no UPS: %+v", rs.events[0])
+	}
+}
+
+func TestMonitorAlarmTransportFailure(t *testing.T) {
+	m, _, fc := newMonitorWithStatus(t, "OL")
+	if err := m.tryConnect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	fc.statusSeq = []string{"OL ALARM"}
+	fc.failAlarm = io.EOF
+	if err := m.pollStatus(context.Background()); !errors.Is(err, io.EOF) {
+		t.Errorf("alarm transport error swallowed: %v", err)
+	}
+}
+
+func TestMonitorNoCommDuringReconnectWait(t *testing.T) {
+	rs := &recordingSink{}
+	m := New(Config{UPS: "ups", ReconnectBackoff: time.Hour, NoCommThreshold: 10 * time.Millisecond},
+		func(context.Context) (Conn, error) { return nil, io.EOF }, rs, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if err := m.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(rs.Kinds(), EventNoComm) {
+		t.Errorf("reconnect wait delayed NOCOMM: %v", rs.Kinds())
+	}
+}
+
+func TestMonitorCancelledBeforeRun(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	rs := &recordingSink{}
+	calls := 0
+	m := New(Config{UPS: "ups"}, func(context.Context) (Conn, error) {
+		calls++
+		return nil, ctx.Err()
+	}, rs, nil)
+	if err := m.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 0 || len(rs.events) != 0 {
+		t.Errorf("cancelled run connected/emitted events: calls=%d events=%v", calls, rs.Kinds())
+	}
+}
+
+type blockingConn struct {
+	*fakeConn
+	entered chan struct{}
+	closed  chan struct{}
+	once    sync.Once
+}
+
+func (c *blockingConn) ListVars(string) (map[string]string, error) {
+	close(c.entered)
+	<-c.closed
+	return nil, io.ErrClosedPipe
+}
+
+func (c *blockingConn) Close() error {
+	c.once.Do(func() { close(c.closed) })
+	return c.fakeConn.Close()
+}
+
+func TestMonitorCancellationInterruptsRead(t *testing.T) {
+	c := &blockingConn{fakeConn: &fakeConn{}, entered: make(chan struct{}), closed: make(chan struct{})}
+	t.Cleanup(func() { _ = c.Close() })
+	rs := &recordingSink{}
+	m := New(Config{UPS: "ups"}, func(context.Context) (Conn, error) { return c, nil }, rs, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- m.Run(ctx) }()
+	select {
+	case <-c.entered:
+	case <-time.After(time.Second):
+		t.Fatal("monitor did not begin initial read")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cancelled monitor did not interrupt blocked read")
+	}
+	if len(rs.Kinds()) != 0 {
+		t.Errorf("shutdown produced communication alerts: %v", rs.Kinds())
+	}
+}
+
+func TestMonitorRejectsEmptyStatus(t *testing.T) {
+	for _, operation := range []string{"connect", "status", "snapshot"} {
+		t.Run(operation, func(t *testing.T) {
+			m, rs, fc := newMonitorWithStatus(t, "OL ALARM")
+			ctx := context.Background()
+			if operation != "connect" {
+				if err := m.tryConnect(ctx); err != nil {
+					t.Fatal(err)
+				}
+			}
+			fc.statusSeq = []string{" "}
+			var err error
+			switch operation {
+			case "connect":
+				err = m.tryConnect(ctx)
+			case "status":
+				err = m.pollStatus(ctx)
+			case "snapshot":
+				err = m.refreshVars(ctx)
+			}
+			if err == nil {
+				t.Error("empty status accepted as healthy snapshot")
+			}
+			if slices.Contains(rs.Kinds(), EventNotAlarm) {
+				t.Errorf("empty status cleared a real alarm: %v", rs.Kinds())
+			}
+		})
+	}
+}
+
+func TestMonitorBulkRefreshMissingStatus(t *testing.T) {
+	for _, failGet := range []error{nil, io.EOF} {
+		t.Run(fmt.Sprint(failGet), func(t *testing.T) {
+			m, rs, fc := newMonitorWithStatus(t, "OL ALARM RB")
+			m.cfg.AlarmDebounce = time.Minute
+			m.cfg.ReplBattDebounce = time.Minute
+			ctx := context.Background()
+			if err := m.tryConnect(ctx); err != nil {
+				t.Fatal(err)
+			}
+			m.alarmFirstSeen = time.Now().Add(-2 * time.Minute)
+			m.rbFirstSeen = m.alarmFirstSeen
+			fc.omitStatus = true
+			fc.statusSeq = []string{"OL"}
+			fc.failGet = failGet
+			if err := m.refreshVars(ctx); !errors.Is(err, failGet) {
+				t.Errorf("refresh error = %v; want %v", err, failGet)
+			}
+			if failGet == nil && m.last.Status != "OL" {
+				t.Errorf("refresh retained stale status: %q", m.last.Status)
+			}
+			if failGet != nil && m.last.Status != "OL ALARM RB" {
+				t.Errorf("failed refresh replaced last good status: %q", m.last.Status)
+			}
+			for _, kind := range []EventKind{EventAlarm, EventReplBatt} {
+				if slices.Contains(rs.Kinds(), kind) {
+					t.Errorf("unobserved stale status confirmed %s", kind)
+				}
+			}
+		})
+	}
+}
+
+func TestMonitorCriticalEventsPrecedeOtherNotifications(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status string
+		want   []EventKind
+	}{
+		{"healthy startup", "OL", []EventKind{EventStartup, EventOnline}},
+		{"critical startup", "OB LB FSD BYPASS", []EventKind{EventFSD, EventLowBatt, EventStartup, EventBypass, EventOnBatt}},
+		{"low battery startup", "OB LB", []EventKind{EventLowBatt, EventStartup, EventOnBatt}},
+		{"critical poll", "OB LB FSD BYPASS", []EventKind{EventFSD, EventLowBatt, EventBypass, EventOnBatt}},
+		{"critical reconnect", "OB LB FSD BYPASS", []EventKind{EventFSD, EventLowBatt, EventCommOK, EventBypass, EventOnBatt}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m, rs, fc := newMonitorWithStatus(t, "OL")
+			ctx := context.Background()
+			if tc.name == "critical poll" || tc.name == "critical reconnect" {
+				if err := m.tryConnect(ctx); err != nil {
+					t.Fatal(err)
+				}
+				if tc.name == "critical reconnect" {
+					m.handleConnErr(ctx, "status", io.EOF)
+				}
+				rs.events = nil
+			}
+			fc.statusSeq = []string{tc.status}
+			var err error
+			if tc.name == "critical poll" {
+				err = m.pollStatus(ctx)
+			} else {
+				err = m.tryConnect(ctx)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := rs.Kinds(); !slices.Equal(got, tc.want) {
+				t.Errorf("events = %v; want %v", got, tc.want)
+			}
+		})
+	}
 }

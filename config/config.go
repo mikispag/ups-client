@@ -4,6 +4,9 @@ package config
 
 import (
 	"fmt"
+	"io"
+	"net/http"
+	"net/url"
 	"os"
 	"sort"
 	"strings"
@@ -124,12 +127,15 @@ func Load(path string) (*Config, error) {
 // Parse loads a Config from raw YAML bytes (useful for tests).
 func Parse(data []byte) (*Config, error) {
 	var c Config
+	c.applyDefaults()
 	dec := yaml.NewDecoder(strings.NewReader(string(data)))
 	dec.KnownFields(true)
 	if err := dec.Decode(&c); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
-	c.applyDefaults()
+	if err := dec.Decode(new(any)); err != io.EOF {
+		return nil, fmt.Errorf("parse config: expected exactly one YAML document")
+	}
 	if err := c.validate(); err != nil {
 		return nil, err
 	}
@@ -167,8 +173,7 @@ func (c *Config) applyDefaults() {
 }
 
 func (c *Config) validate() error {
-	// Reject zero/negative durations and unreasonably large polling
-	// intervals — those silently break monitoring.
+	// Zero disables NOCOMM or debounce; polling and I/O need positive durations.
 	for _, v := range []struct {
 		name string
 		d    time.Duration
@@ -177,12 +182,9 @@ func (c *Config) validate() error {
 	}{
 		{"monitor.status_interval", c.Monitor.StatusInterval, 500 * time.Millisecond, 5 * time.Minute},
 		{"monitor.snapshot_interval", c.Monitor.SnapshotInterval, time.Second, 30 * time.Minute},
-		// applyDefaults rewrites 0 → default for these two, so the lower
-		// bound here matches what the user can actually realize via YAML
-		// (rather than the unreachable monitor.go disable sentinel of 0).
-		{"monitor.nocomm_threshold", c.Monitor.NoCommThreshold, time.Second, time.Hour},
-		{"monitor.replbatt_debounce", c.Monitor.ReplBattDebounce, time.Second, 24 * time.Hour},
-		{"monitor.alarm_debounce", c.Monitor.AlarmDebounce, time.Second, time.Hour},
+		{"monitor.nocomm_threshold", c.Monitor.NoCommThreshold, 0, time.Hour},
+		{"monitor.replbatt_debounce", c.Monitor.ReplBattDebounce, 0, 24 * time.Hour},
+		{"monitor.alarm_debounce", c.Monitor.AlarmDebounce, 0, time.Hour},
 		{"monitor.reconnect_backoff", c.Monitor.ReconnectBackoff, 100 * time.Millisecond, time.Minute},
 		{"nut.timeout", c.NUT.Timeout, 100 * time.Millisecond, time.Minute},
 	} {
@@ -194,7 +196,15 @@ func (c *Config) validate() error {
 		}
 	}
 	known := allEventNames()
-	check := func(target string, ev []string) error {
+	check := func(target string, timeout time.Duration, ev []string, templates ...string) error {
+		if timeout < 0 {
+			return fmt.Errorf("%s: timeout must be >= 0", target)
+		}
+		for _, raw := range templates {
+			if err := notifier.ValidateTemplate(target, raw); err != nil {
+				return err
+			}
+		}
 		for _, e := range ev {
 			up := strings.ToUpper(strings.TrimSpace(e))
 			if _, ok := known[up]; !ok {
@@ -207,7 +217,7 @@ func (c *Config) validate() error {
 		if t.Command == "" {
 			return fmt.Errorf("shell[%d]: command is required", i)
 		}
-		if err := check(fmt.Sprintf("shell[%d]", i), t.Events); err != nil {
+		if err := check(fmt.Sprintf("shell[%d]", i), t.Timeout, t.Events, t.Args...); err != nil {
 			return err
 		}
 	}
@@ -215,8 +225,21 @@ func (c *Config) validate() error {
 		if t.URL == "" {
 			return fmt.Errorf("webhook[%d]: url is required", i)
 		}
-		if err := check(fmt.Sprintf("webhook[%d]", i), t.Events); err != nil {
+		target := fmt.Sprintf("webhook[%d]", i)
+		templates := []string{t.URL, t.Body}
+		for _, header := range t.Headers {
+			templates = append(templates, header)
+		}
+		if err := check(target, t.Timeout, t.Events, templates...); err != nil {
 			return err
+		}
+		if !strings.Contains(t.URL, "{{") {
+			if err := validateHTTPURL(target+".url", t.URL); err != nil {
+				return err
+			}
+		}
+		if _, err := http.NewRequest(strings.ToUpper(strings.TrimSpace(t.Method)), "https://example.invalid", nil); err != nil {
+			return fmt.Errorf("%s: invalid HTTP method", target)
 		}
 	}
 	for i, t := range c.Notifications.SSH {
@@ -226,7 +249,10 @@ func (c *Config) validate() error {
 		if t.Password == "" && t.PrivateKeyFile == "" {
 			return fmt.Errorf("ssh[%d]: set either password or private_key_file", i)
 		}
-		if err := check(fmt.Sprintf("ssh[%d]", i), t.Events); err != nil {
+		if t.Port < 0 || t.Port > 65535 {
+			return fmt.Errorf("ssh[%d]: port must be 0 (default) or between 1 and 65535", i)
+		}
+		if err := check(fmt.Sprintf("ssh[%d]", i), t.Timeout, t.Events, t.Command); err != nil {
 			return err
 		}
 	}
@@ -234,9 +260,29 @@ func (c *Config) validate() error {
 		if t.BotToken == "" || t.ChatID == "" {
 			return fmt.Errorf("telegram[%d]: bot_token and chat_id are required", i)
 		}
-		if err := check(fmt.Sprintf("telegram[%d]", i), t.Events); err != nil {
+		target := fmt.Sprintf("telegram[%d]", i)
+		if t.APIBase != "" {
+			if err := validateHTTPURL(target+".api_base", t.APIBase); err != nil {
+				return err
+			}
+		}
+		switch t.ParseMode {
+		case "", "Markdown", "MarkdownV2", "HTML":
+		default:
+			return fmt.Errorf("%s: parse_mode must be Markdown, MarkdownV2, HTML or empty", target)
+		}
+		if err := check(target, t.Timeout, t.Events, t.Message); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func validateHTTPURL(field, raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil || u.Hostname() == "" || (u.Scheme != "http" && u.Scheme != "https") {
+		// URLs may contain credentials; report the field without its value.
+		return fmt.Errorf("%s: expected an absolute HTTP(S) URL", field)
 	}
 	return nil
 }

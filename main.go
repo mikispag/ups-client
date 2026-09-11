@@ -44,6 +44,14 @@ func main() {
 		log.Error("config", "err", err)
 		os.Exit(1)
 	}
+	var tlsCfg *tls.Config
+	if cfg.NUT.TLS != nil && cfg.NUT.TLS.Enable {
+		tlsCfg, err = buildTLSConfig(cfg.NUT.TLS)
+		if err != nil {
+			log.Error("TLS config", "err", err)
+			os.Exit(1)
+		}
+	}
 	if *checkOnly {
 		fmt.Println("config OK")
 		return
@@ -57,13 +65,10 @@ func main() {
 		if err != nil {
 			return nil, err
 		}
-		if cfg.NUT.TLS != nil && cfg.NUT.TLS.Enable {
-			tlsCfg, terr := buildTLSConfig(cfg.NUT.TLS)
-			if terr != nil {
-				_ = c.Close()
-				return nil, terr
-			}
-			if err := c.StartTLS(tlsCfg); err != nil {
+		stop := context.AfterFunc(ctx, func() { _ = c.Close() })
+		defer stop()
+		if tlsCfg != nil {
+			if err := c.StartTLSContext(ctx, tlsCfg); err != nil {
 				_ = c.Close()
 				return nil, err
 			}
@@ -82,6 +87,8 @@ func main() {
 			os.Exit(2)
 		}
 		defer c.Close()
+		stop := context.AfterFunc(ctx, func() { _ = c.Close() })
+		defer stop()
 		vars, err := c.ListVars(cfg.NUT.UPS)
 		if err != nil {
 			log.Error("list vars", "err", err)

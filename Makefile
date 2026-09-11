@@ -21,7 +21,10 @@ INST_UNIT    := $(DESTDIR)$(UNITDIR)
 INST_SYSUSER := $(DESTDIR)$(SYSUSERSDIR)
 
 .PHONY: all build install install-bin install-config install-systemd uninstall \
-        test test-race cover vet check tidy clean help
+        install-postinstall-warning test test-race cover vet check tidy clean help
+
+# Keep tidy from mutating the module files while other housekeeping steps run.
+.NOTPARALLEL: all
 
 ## all: housekeeping pass — tidy + vet + race tests + build (the default)
 all: tidy vet test-race build
@@ -29,19 +32,19 @@ all: tidy vet test-race build
 ## build: compile the static binary into ./bin/$(BINARY)
 build:
 	@mkdir -p bin
-	go build $(GOFLAGS) -ldflags '$(LDFLAGS)' -o bin/$(BINARY) .
+	CGO_ENABLED=0 go build $(GOFLAGS) -ldflags '$(LDFLAGS)' -o bin/$(BINARY) .
 
 ## install: install binary, systemd unit, sysusers snippet, and example config
-install: build install-bin install-systemd install-config
+install: install-bin install-systemd install-config
 	@$(MAKE) -s install-postinstall-warning
 
-install-bin:
+install-bin: build
 	install -d $(INST_BIN)
 	install -m 0755 bin/$(BINARY) $(INST_BIN)/$(BINARY)
 
 install-systemd:
 	install -d $(INST_UNIT)
-	sed 's,@BINDIR@,$(BINDIR),g' init/ups-client.service.in > $(INST_UNIT)/ups-client.service
+	sed 's,@BINDIR@,$(BINDIR),g; s,@SYSCONFDIR@,$(SYSCONFDIR),g' init/ups-client.service.in > $(INST_UNIT)/ups-client.service
 	chmod 0644 $(INST_UNIT)/ups-client.service
 	install -d $(INST_SYSUSER)
 	install -m 0644 init/ups-client.sysusers $(INST_SYSUSER)/ups-client.conf

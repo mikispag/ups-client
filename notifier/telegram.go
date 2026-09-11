@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mikispag/ups-client/monitor"
@@ -28,7 +29,8 @@ type TelegramTarget struct {
 	Timeout   time.Duration
 	Filter    Filter
 
-	client *http.Client
+	client     *http.Client
+	clientOnce sync.Once
 }
 
 // Name implements Notifier.
@@ -71,7 +73,8 @@ func (t *TelegramTarget) Notify(ctx context.Context, e monitor.Event) error {
 	form := url.Values{}
 	form.Set("chat_id", t.ChatID)
 	form.Set("text", text)
-	if t.ParseMode != "" {
+	// The fallback summary is plain text and contains unescaped punctuation.
+	if t.ParseMode != "" && t.Message != "" {
 		form.Set("parse_mode", t.ParseMode)
 	}
 
@@ -99,19 +102,30 @@ func (t *TelegramTarget) Notify(ctx context.Context, e monitor.Event) error {
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode >= 400 {
-		// Telegram API returns JSON like {"ok":false,"error_code":400,"description":"..."}
-		var apiErr struct {
-			OK          bool   `json:"ok"`
-			ErrorCode   int    `json:"error_code"`
-			Description string `json:"description"`
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
+	if err != nil {
+		return fmt.Errorf("%s: read response: %s", t.Name(), redactToken(err.Error(), t.BotToken))
+	}
+	if len(body) > maxResponseBytes {
+		return fmt.Errorf("%s: response exceeds %d bytes", t.Name(), maxResponseBytes)
+	}
+	var response struct {
+		OK          bool   `json:"ok"`
+		ErrorCode   int    `json:"error_code"`
+		Description string `json:"description"`
+	}
+	decodeErr := json.Unmarshal(body, &response)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 || !response.OK {
+		if response.Description != "" {
+			return fmt.Errorf("%s: %d %s", t.Name(), response.ErrorCode, redactToken(response.Description, t.BotToken))
 		}
-		_ = json.Unmarshal(body, &apiErr)
-		if apiErr.Description != "" {
-			return fmt.Errorf("%s: %d %s", t.Name(), apiErr.ErrorCode, apiErr.Description)
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			return fmt.Errorf("%s: invalid or unsuccessful API response", t.Name())
 		}
 		return fmt.Errorf("%s: HTTP %d", t.Name(), resp.StatusCode)
+	}
+	if decodeErr != nil {
+		return fmt.Errorf("%s: invalid API response", t.Name())
 	}
 	return nil
 }
@@ -133,13 +147,15 @@ func redactToken(s, token string) string {
 }
 
 func (t *TelegramTarget) httpClient() *http.Client {
-	if t.client != nil {
-		return t.client
-	}
-	timeout := t.Timeout
-	if timeout <= 0 {
-		timeout = 10 * time.Second
-	}
-	t.client = &http.Client{Timeout: timeout}
+	t.clientOnce.Do(func() {
+		if t.client != nil {
+			return
+		}
+		timeout := t.Timeout
+		if timeout <= 0 {
+			timeout = 10 * time.Second
+		}
+		t.client = &http.Client{Timeout: timeout, CheckRedirect: rejectRedirect}
+	})
 	return t.client
 }

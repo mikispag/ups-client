@@ -21,8 +21,8 @@ type fakeNotifier struct {
 	mu      sync.Mutex
 }
 
-func (f *fakeNotifier) Name() string                { return f.name }
-func (f *fakeNotifier) Match(e monitor.Event) bool  { return f.filter.Match(e.Kind) }
+func (f *fakeNotifier) Name() string               { return f.name }
+func (f *fakeNotifier) Match(e monitor.Event) bool { return f.filter.Match(e.Kind) }
 func (f *fakeNotifier) Notify(_ context.Context, e monitor.Event) error {
 	f.calls.Add(1)
 	f.mu.Lock()

@@ -3,8 +3,15 @@ package nut
 import (
 	"bufio"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"errors"
+	"fmt"
 	"io"
+	"math/big"
 	"net"
 	"reflect"
 	"sort"
@@ -251,14 +258,14 @@ func TestLogin(t *testing.T) {
 	fs := newFakeServer(t, map[string]string{
 		// Login quotes username and password so spaces and quotes don't
 		// frame-shift the upsd parser.
-		`USERNAME "admin"`:    "OK",
-		`PASSWORD "secret"`:   "OK",
-		`LOGIN ups`:           "OK",
-		`USERNAME "bad"`:      "OK",
-		`PASSWORD "bad"`:      "ERR INVALID-PASSWORD",
-		`USERNAME "u s er"`:   "OK",
-		`PASSWORD "p\"\\w"`:   "OK",
-		`LOGOUT`:              "OK Goodbye",
+		`USERNAME "admin"`:  "OK",
+		`PASSWORD "secret"`: "OK",
+		`LOGIN ups`:         "OK",
+		`USERNAME "bad"`:    "OK",
+		`PASSWORD "bad"`:    "ERR INVALID-PASSWORD",
+		`USERNAME "u s er"`: "OK",
+		`PASSWORD "p\"\\w"`: "OK",
+		`LOGOUT`:            "OK Goodbye",
 	})
 	c, err := Dial(context.Background(), fs.addr, time.Second)
 	if err != nil {
@@ -302,14 +309,13 @@ func TestLogin(t *testing.T) {
 }
 
 func TestDialDefaultPort(t *testing.T) {
-	// We cannot dial 3493 reliably in CI; instead test the address rewriting
-	// by attempting a hostname-only dial against an unroutable IP and
-	// confirming the error string mentions the appended port.
-	_, err := Dial(context.Background(), "127.0.0.1", 50*time.Millisecond)
-	if err == nil || !strings.Contains(err.Error(), "3493") {
-		// This either succeeds (real upsd running) or fails citing the
-		// default port. Either is acceptable; only fail if neither.
-		t.Logf("Dial(127.0.0.1) err = %v", err)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	for _, addr := range []string{"127.0.0.1", "::1", "[::1]", "fe80::1%lo"} {
+		_, err := Dial(ctx, addr, time.Second)
+		if err == nil || !strings.Contains(err.Error(), ":3493") {
+			t.Errorf("Dial(%q) did not append default port: %v", addr, err)
+		}
 	}
 }
 
@@ -345,5 +351,291 @@ func TestStatusTokensSorted(t *testing.T) {
 	tokens := ParseStatus("OL CHRG OB").Tokens()
 	if !sort.StringsAreSorted(tokens) {
 		t.Errorf("tokens not sorted: %v", tokens)
+	}
+}
+
+func TestRejectMalformedResponses(t *testing.T) {
+	tests := []struct {
+		name, command, response string
+		call                    func(*Client) error
+	}{
+		{"username acknowledgment", `USERNAME "user"`, "NOT OK", func(c *Client) error { return c.Login("user", "", "") }},
+		{"get wrong UPS", "GET VAR ups ups.status", `VAR other ups.status "OL"`, func(c *Client) error { _, err := c.GetVar("ups", "ups.status"); return err }},
+		{"get wrong variable", "GET VAR ups ups.status", `VAR ups battery.charge "OL"`, func(c *Client) error { _, err := c.GetVar("ups", "ups.status"); return err }},
+		{"get unterminated string", "GET VAR ups ups.status", `VAR ups ups.status "OL`, func(c *Client) error { _, err := c.GetVar("ups", "ups.status"); return err }},
+		{"get extra value", "GET VAR ups ups.status", `VAR ups ups.status "OL" junk`, func(c *Client) error { _, err := c.GetVar("ups", "ups.status"); return err }},
+		{"list header suffix", "LIST VAR ups", "BEGIN LIST VAR ups2\nEND LIST VAR ups", func(c *Client) error { _, err := c.ListVars("ups"); return err }},
+		{"list footer suffix", "LIST VAR ups", "BEGIN LIST VAR ups\nEND LIST VAR ups2", func(c *Client) error { _, err := c.ListVars("ups"); return err }},
+		{"list wrong UPS", "LIST VAR ups", "BEGIN LIST VAR ups\nVAR other ups.status \"OB\"\nEND LIST VAR ups", func(c *Client) error { _, err := c.ListVars("ups"); return err }},
+		{"list invalid row", "LIST VAR ups", "BEGIN LIST VAR ups\nGARBAGE\nEND LIST VAR ups", func(c *Client) error { _, err := c.ListVars("ups"); return err }},
+		{"list UPS invalid row", "LIST UPS", "BEGIN LIST UPS\nGARBAGE\nEND LIST UPS", func(c *Client) error { _, err := c.ListUPS(); return err }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fs := newFakeServer(t, map[string]string{tt.command: tt.response, `PASSWORD ""`: "OK"})
+			c, err := Dial(context.Background(), fs.addr, time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer c.Close()
+			if err := tt.call(c); err == nil {
+				t.Fatal("accepted malformed response")
+			}
+		})
+	}
+}
+
+type recordingConn struct {
+	net.Conn
+	input  *strings.Reader
+	output strings.Builder
+}
+
+func (c *recordingConn) Read(p []byte) (int, error)  { return c.input.Read(p) }
+func (c *recordingConn) Write(p []byte) (int, error) { return c.output.Write(p) }
+
+func TestRejectCommandInjection(t *testing.T) {
+	for _, call := range []func(*Client) error{
+		func(c *Client) error { return c.Login("user\nFSD ups", "password", "ups") },
+		func(c *Client) error { return c.Login("user", "secret\r\nFSD ups", "ups") },
+		func(c *Client) error { _, err := c.GetVar("ups\nFSD ups", "ups.status"); return err },
+		func(c *Client) error { _, err := c.GetVar("ups", "ups.status\x00"); return err },
+		func(c *Client) error { _, err := c.ListVars("ups\r\nFSD ups"); return err },
+	} {
+		conn := &recordingConn{input: strings.NewReader("OK\nOK\nOK\n")}
+		c := &Client{conn: conn, rd: bufio.NewReader(conn)}
+		if err := call(c); err == nil {
+			t.Error("accepted command injection")
+		}
+		if conn.output.Len() != 0 {
+			t.Errorf("wrote invalid command: %q", conn.output.String())
+		}
+	}
+}
+
+func TestCloseInterruptsBlockedRead(t *testing.T) {
+	client, server := net.Pipe()
+	defer server.Close()
+	c := &Client{conn: client, rd: bufio.NewReader(client)}
+	readDone := make(chan error, 1)
+	go func() { _, err := c.GetVar("ups", "ups.status"); readDone <- err }()
+	if _, err := bufio.NewReader(server).ReadString('\n'); err != nil {
+		t.Fatal(err)
+	}
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- c.Close() }()
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		server.Close()
+		t.Fatal("Close blocked writing LOGOUT instead of interrupting read")
+	}
+	if err := <-readDone; err == nil {
+		t.Fatal("blocked command succeeded after close")
+	}
+	if err := c.Close(); err != nil {
+		t.Fatalf("repeated close: %v", err)
+	}
+	if _, err := c.GetVar("ups", "ups.status"); err == nil {
+		t.Fatal("command after close succeeded")
+	}
+}
+
+func TestTLSInfersServerName(t *testing.T) {
+	public, private, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "test"},
+		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour),
+		IPAddresses: []net.IP{net.ParseIP("127.0.0.1")},
+		KeyUsage:    x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, public, private)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roots := x509.NewCertPool()
+	roots.AddCert(cert)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	serverDone := make(chan error, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		defer conn.Close()
+		conn.SetDeadline(time.Now().Add(2 * time.Second))
+		if _, err := bufio.NewReader(conn).ReadString('\n'); err != nil {
+			serverDone <- err
+			return
+		}
+		if _, err := fmt.Fprint(conn, "OK STARTTLS\n"); err != nil {
+			serverDone <- err
+			return
+		}
+		secure := tls.Server(conn, &tls.Config{Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: private}}})
+		if err := secure.Handshake(); err != nil {
+			serverDone <- err
+			return
+		}
+		if _, err := bufio.NewReader(secure).ReadString('\n'); err != nil {
+			serverDone <- err
+			return
+		}
+		_, err = fmt.Fprint(secure, "VAR ups ups.status \"OL\"\n")
+		serverDone <- err
+	}()
+	c, err := Dial(context.Background(), listener.Addr().String(), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	cfg := &tls.Config{RootCAs: roots}
+	if err := c.StartTLS(cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ServerName != "" {
+		t.Fatal("StartTLS mutated caller configuration")
+	}
+	if got, err := c.GetVar("ups", "ups.status"); err != nil || got != "OL" {
+		t.Fatalf("TLS GET = %q, %v", got, err)
+	}
+	if err := <-serverDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestResponseLineLimit(t *testing.T) {
+	conn := &recordingConn{input: strings.NewReader(strings.Repeat("x", 1<<20) + "\n")}
+	c := &Client{conn: conn, rd: bufio.NewReader(conn)}
+	if _, err := c.readLine(); err == nil {
+		t.Fatal("accepted oversized response")
+	}
+}
+
+func TestStartTLSContextCancellation(t *testing.T) {
+	for _, acknowledge := range []bool{false, true} {
+		t.Run(fmt.Sprint(acknowledge), func(t *testing.T) {
+			client, server := net.Pipe()
+			defer server.Close()
+			c := &Client{conn: client, rd: bufio.NewReader(client)}
+			defer c.Close()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := make(chan error, 1)
+			go func() { done <- c.StartTLSContext(ctx, &tls.Config{ServerName: "localhost"}) }()
+			if _, err := bufio.NewReader(server).ReadString('\n'); err != nil {
+				t.Fatal(err)
+			}
+			if acknowledge {
+				if _, err := fmt.Fprint(server, "OK STARTTLS\n"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			cancel()
+			select {
+			case err := <-done:
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("cancellation returned %v", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("TLS negotiation did not cancel")
+			}
+		})
+	}
+}
+
+func TestStartTLSRejectsUnexpectedAcknowledgment(t *testing.T) {
+	conn := &recordingConn{input: strings.NewReader("OK\n")}
+	c := &Client{conn: conn, rd: bufio.NewReader(conn)}
+	if err := c.StartTLS(nil); err == nil {
+		t.Fatal("accepted incorrect STARTTLS acknowledgment")
+	}
+	if conn.output.String() != "STARTTLS\n" {
+		t.Fatalf("sent TLS data before acknowledgment: %q", conn.output.String())
+	}
+}
+
+func TestQuotedIdentifiers(t *testing.T) {
+	fs := newFakeServer(t, map[string]string{
+		`GET VAR "server ups" device.model`: `VAR "server ups" device.model "a \"quoted\" model"`,
+		`LIST VAR "server ups"`:             "BEGIN LIST VAR \"server ups\"\nVAR \"server ups\" ups.status \"OL\"\nEND LIST VAR \"server ups\"",
+	})
+	c, err := Dial(context.Background(), fs.addr, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if value, err := c.GetVar("server ups", "device.model"); err != nil || value != `a "quoted" model` {
+		t.Fatalf("GetVar = %q, %v", value, err)
+	}
+	if vars, err := c.ListVars("server ups"); err != nil || vars["ups.status"] != "OL" {
+		t.Fatalf("ListVars = %v, %v", vars, err)
+	}
+}
+
+func TestListResponseSizeLimit(t *testing.T) {
+	var response strings.Builder
+	response.WriteString("BEGIN LIST VAR ups\n")
+	for i := 0; i < 40000; i++ {
+		fmt.Fprintf(&response, "VAR ups battery.variable.%d \"100\"\n", i)
+	}
+	response.WriteString("END LIST VAR ups\n")
+	fs := newFakeServer(t, map[string]string{"LIST VAR ups": response.String()})
+	c, err := Dial(context.Background(), fs.addr, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if _, err := c.ListVars("ups"); err == nil || !strings.Contains(err.Error(), "response exceeds") {
+		t.Fatalf("oversized LIST response returned %v", err)
+	}
+}
+
+func TestListTimeoutCoversWholeResponse(t *testing.T) {
+	client, server := net.Pipe()
+	defer server.Close()
+	c := &Client{conn: client, rd: bufio.NewReader(client), timeout: 100 * time.Millisecond}
+	defer c.Close()
+	done := make(chan error, 1)
+	go func() { _, err := c.ListVars("ups"); done <- err }()
+	if _, err := bufio.NewReader(server).ReadString('\n'); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fmt.Fprint(server, "BEGIN LIST VAR ups\n"); err != nil {
+		t.Fatal(err)
+	}
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	limit := time.NewTimer(400 * time.Millisecond)
+	defer limit.Stop()
+	for {
+		select {
+		case err := <-done:
+			var netErr net.Error
+			if !errors.As(err, &netErr) || !netErr.Timeout() {
+				t.Fatalf("LIST returned %v, want timeout", err)
+			}
+			return
+		case <-ticker.C:
+			server.SetWriteDeadline(time.Now().Add(20 * time.Millisecond))
+			_, _ = fmt.Fprint(server, "VAR ups ups.status \"OL\"\n")
+		case <-limit.C:
+			t.Fatal("LIST rows kept extending the command deadline")
+		}
 	}
 }

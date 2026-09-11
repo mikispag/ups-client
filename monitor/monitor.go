@@ -73,6 +73,8 @@ func (s Snapshot) Get(name string) string { return s.Vars[name] }
 
 // Event is the value passed to notifiers when the monitor detects an
 // upsmon-style state transition.
+// FSD and LOWBATT are dispatched first when a snapshot contains multiple
+// new conditions, ahead of communication recovery, startup, and other edges.
 type Event struct {
 	Kind     EventKind
 	Snapshot Snapshot
@@ -82,6 +84,7 @@ type Event struct {
 
 // Conn is the subset of nut.Client behavior the monitor relies on. It is
 // extracted so tests can swap in a fake without standing up a TCP server.
+// Close must be safe concurrently with other methods and interrupt blocked IO.
 type Conn interface {
 	GetVar(ups, name string) (string, error)
 	ListVars(ups string) (map[string]string, error)
@@ -139,10 +142,11 @@ type Monitor struct {
 	sink   Sink
 	log    *slog.Logger
 
-	conn    Conn
-	prev    nut.Status
-	last    Snapshot // most recent successful snapshot (for event payloads)
-	started bool
+	conn      Conn
+	prev      nut.Status
+	last      Snapshot // most recent successful snapshot (for event payloads)
+	started   bool
+	stopClose func() bool
 
 	commBad       bool
 	commBadSince  time.Time
@@ -170,11 +174,15 @@ func New(cfg Config, dialer Dialer, sink Sink, log *slog.Logger) *Monitor {
 	if cfg.ReconnectBackoff <= 0 {
 		cfg.ReconnectBackoff = time.Second
 	}
-	return &Monitor{cfg: cfg, dialer: dialer, sink: sink, log: log}
+	if cfg.ReconnectBackoff > 30*time.Second {
+		cfg.ReconnectBackoff = 30 * time.Second
+	}
+	return &Monitor{cfg: cfg, dialer: dialer, sink: sink, log: log, last: Snapshot{UPS: cfg.UPS}}
 }
 
 // Run blocks, polling and emitting events until ctx is cancelled.
 func (m *Monitor) Run(ctx context.Context) error {
+	defer m.closeConn()
 	statusTicker := time.NewTicker(m.cfg.StatusInterval)
 	defer statusTicker.Stop()
 	snapTicker := time.NewTicker(m.cfg.SnapshotInterval)
@@ -184,13 +192,17 @@ func (m *Monitor) Run(ctx context.Context) error {
 	const maxBackoff = 30 * time.Second
 
 	for {
+		if ctx.Err() != nil {
+			return nil
+		}
 		if m.conn == nil {
 			if err := m.tryConnect(ctx); err != nil {
-				m.markCommBad(ctx, fmt.Sprintf("connect: %v", err))
-				select {
-				case <-ctx.Done():
+				if ctx.Err() != nil {
 					return nil
-				case <-time.After(backoff):
+				}
+				m.markCommBad(ctx, fmt.Sprintf("connect: %v", err))
+				if !m.waitReconnect(ctx, backoff) {
+					return nil
 				}
 				if backoff < maxBackoff {
 					backoff *= 2
@@ -205,20 +217,49 @@ func (m *Monitor) Run(ctx context.Context) error {
 
 		select {
 		case <-ctx.Done():
-			if m.conn != nil {
-				_ = m.conn.Close()
-				m.conn = nil
-			}
 			return nil
 		case <-statusTicker.C:
 			if err := m.pollStatus(ctx); err != nil {
 				m.handleConnErr(ctx, "status", err)
 			}
 		case <-snapTicker.C:
-			if err := m.refreshVars(); err != nil {
+			if err := m.refreshVars(ctx); err != nil {
 				m.handleConnErr(ctx, "snapshot", err)
 			}
 		}
+	}
+}
+
+func (m *Monitor) waitReconnect(ctx context.Context, backoff time.Duration) bool {
+	retry := time.NewTimer(backoff)
+	defer retry.Stop()
+	var noComm <-chan time.Time
+	if !m.noCommEmitted && m.cfg.NoCommThreshold > 0 {
+		timer := time.NewTimer(time.Until(m.commBadSince.Add(m.cfg.NoCommThreshold)))
+		defer timer.Stop()
+		noComm = timer.C
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-retry.C:
+			return true
+		case <-noComm:
+			m.markCommBad(ctx, "")
+			noComm = nil
+		}
+	}
+}
+
+func (m *Monitor) closeConn() {
+	if m.stopClose != nil {
+		m.stopClose()
+		m.stopClose = nil
+	}
+	if m.conn != nil {
+		_ = m.conn.Close()
+		m.conn = nil
 	}
 }
 
@@ -228,11 +269,11 @@ func (m *Monitor) tryConnect(ctx context.Context) error {
 		return err
 	}
 	m.conn = c
+	m.stopClose = context.AfterFunc(ctx, func() { _ = c.Close() })
 
 	vars, err := m.conn.ListVars(m.cfg.UPS)
 	if err != nil {
-		_ = m.conn.Close()
-		m.conn = nil
+		m.closeConn()
 		return err
 	}
 	rawStatus := vars["ups.status"]
@@ -240,8 +281,7 @@ func (m *Monitor) tryConnect(ctx context.Context) error {
 		// Fall back to a focused GET if the bulk listing somehow omits it.
 		s, gerr := m.conn.GetVar(m.cfg.UPS, "ups.status")
 		if gerr != nil {
-			_ = m.conn.Close()
-			m.conn = nil
+			m.closeConn()
 			return gerr
 		}
 		rawStatus = s
@@ -249,6 +289,10 @@ func (m *Monitor) tryConnect(ctx context.Context) error {
 	}
 
 	tokens := nut.ParseStatus(rawStatus)
+	if len(tokens) == 0 {
+		m.closeConn()
+		return errors.New("empty ups.status")
+	}
 	snap := Snapshot{
 		UPS:    m.cfg.UPS,
 		Status: rawStatus,
@@ -257,32 +301,18 @@ func (m *Monitor) tryConnect(ctx context.Context) error {
 		Time:   time.Now(),
 	}
 
-	// Surface communication recovery before any other event so operators see
-	// it regardless of whether this is the very first connect attempt or a
-	// reconnection.
 	if m.commBad {
-		m.emit(ctx, Event{Kind: EventCommOK, Snapshot: snap, Previous: m.last, Message: "communication restored"})
-		// Don't carry RB-debounce state across an outage: we couldn't
-		// observe the token during it, so any post-reconnect RB needs a
-		// fresh debounce window. Same reasoning for ALARM.
+		// Restart pending debounce windows after an unobserved interval,
+		// but preserve confirmed faults until we observe them clearing.
 		m.rbFirstSeen = time.Time{}
-		m.rbConfirmed = false
 		m.alarmFirstSeen = time.Time{}
-		m.alarmConfirmed = false
 	}
 
-	if !m.started {
-		m.last = snap
-		m.prev = tokens
-		m.started = true
-		m.emit(ctx, Event{Kind: EventStartup, Snapshot: snap, Previous: snap, Message: "monitor started"})
-	} else {
-		// Reconnected — diff against the last-known good token set so we
-		// surface anything that flipped during the outage.
-		m.diffAndEmit(ctx, snap, tokens)
-		m.last = snap
-		m.prev = tokens
-	}
+	// Include active conditions on first observation and any transitions
+	// since the last successful observation after reconnecting.
+	m.diffAndEmit(ctx, snap, tokens)
+	m.last = snap
+	m.prev = tokens
 	m.commBad = false
 	m.commBadSince = time.Time{}
 	m.noCommEmitted = false
@@ -298,6 +328,9 @@ func (m *Monitor) pollStatus(ctx context.Context) error {
 		return err
 	}
 	tokens := nut.ParseStatus(raw)
+	if len(tokens) == 0 {
+		return errors.New("empty ups.status")
+	}
 	snap := m.last
 	snap.Status = raw
 	snap.Tokens = tokens.Tokens()
@@ -316,10 +349,14 @@ func (m *Monitor) pollStatus(ctx context.Context) error {
 
 	// Surface ups.alarm whenever ALARM is asserted so notifiers can render
 	// the actual reason ("Replace battery", "Battery overheated", ...). The
-	// fetch is best-effort: drivers don't always expose the variable, and a
-	// failure here must not tear the connection down.
+	// fetch is best-effort: drivers don't always expose the variable. An
+	// unsupported variable is harmless, but transport failures invalidate
+	// the connection and cannot be ignored.
 	if tokens.Has("ALARM") {
-		if a, aerr := m.conn.GetVar(m.cfg.UPS, "ups.alarm"); aerr == nil && a != "" {
+		delete(snap.Vars, "ups.alarm")
+		if a, aerr := m.conn.GetVar(m.cfg.UPS, "ups.alarm"); aerr != nil && nut.IsTransient(aerr) {
+			return aerr
+		} else if aerr == nil && a != "" {
 			snap.Vars["ups.alarm"] = a
 		}
 	} else {
@@ -332,7 +369,7 @@ func (m *Monitor) pollStatus(ctx context.Context) error {
 	return nil
 }
 
-func (m *Monitor) refreshVars() error {
+func (m *Monitor) refreshVars(ctx context.Context) error {
 	if m.conn == nil {
 		return errors.New("not connected")
 	}
@@ -340,11 +377,22 @@ func (m *Monitor) refreshVars() error {
 	if err != nil {
 		return err
 	}
-	m.last.Vars = vars
-	if s, ok := vars["ups.status"]; ok {
-		m.last.Status = s
+	raw, ok := vars["ups.status"]
+	if !ok {
+		raw, err = m.conn.GetVar(m.cfg.UPS, "ups.status")
+		if err != nil {
+			return err
+		}
+		vars["ups.status"] = raw
 	}
-	m.last.Time = time.Now()
+	tokens := nut.ParseStatus(raw)
+	if len(tokens) == 0 {
+		return errors.New("empty ups.status")
+	}
+	snap := Snapshot{UPS: m.cfg.UPS, Status: raw, Tokens: tokens.Tokens(), Vars: vars, Time: time.Now()}
+	m.diffAndEmit(ctx, snap, tokens)
+	m.last = snap
+	m.prev = tokens
 	return nil
 }
 
@@ -352,6 +400,24 @@ func (m *Monitor) diffAndEmit(ctx context.Context, snap Snapshot, cur nut.Status
 	prev := m.prev
 	if prev == nil {
 		prev = nut.Status{}
+	}
+
+	// Dispatch shutdown conditions before any potentially slow informational
+	// notifications, including initial startup and communication recovery.
+	if cur.Has("FSD") && !prev.Has("FSD") {
+		m.emit(ctx, Event{Kind: EventFSD, Snapshot: snap, Previous: m.last, Message: m.describe(EventFSD, snap)})
+	}
+	// LOWBATT requires both LB and OB. A bare LB on mains can be an APC
+	// firmware self-test artifact and must not initiate a local shutdown.
+	if cur.Has("LB") && cur.Has("OB") && !(prev.Has("LB") && prev.Has("OB")) {
+		m.emit(ctx, Event{Kind: EventLowBatt, Snapshot: snap, Previous: m.last, Message: m.describe(EventLowBatt, snap)})
+	}
+	if m.commBad {
+		m.emit(ctx, Event{Kind: EventCommOK, Snapshot: snap, Previous: m.last, Message: "communication restored"})
+	}
+	if !m.started {
+		m.started = true
+		m.emit(ctx, Event{Kind: EventStartup, Snapshot: snap, Previous: snap, Message: "monitor started"})
 	}
 
 	// Stable iteration order so test assertions are deterministic.
@@ -367,8 +433,8 @@ func (m *Monitor) diffAndEmit(ctx context.Context, snap Snapshot, cur nut.Status
 		entered := cur.Has(tok) && !prev.Has(tok)
 		left := !cur.Has(tok) && prev.Has(tok)
 
-		if tok == "RB" || tok == "LB" || tok == "ALARM" {
-			// Handled below with debounce / once-per-OB-session semantics.
+		if tok == "FSD" || tok == "RB" || tok == "LB" || tok == "ALARM" {
+			// Shutdown conditions and debounced faults have dedicated handling.
 			continue
 		}
 		if entered && edge.enter != "" {
@@ -377,16 +443,6 @@ func (m *Monitor) diffAndEmit(ctx context.Context, snap Snapshot, cur nut.Status
 		if left && edge.leave != "" {
 			m.emit(ctx, Event{Kind: edge.leave, Snapshot: snap, Previous: m.last, Message: m.describe(edge.leave, snap)})
 		}
-	}
-
-	// LOWBATT only fires when LB AND OB are both set on the new status.
-	// A bare LB during OL has no operational meaning (no shutdown is
-	// coming — mains are good) and APC BX-series firmware spuriously
-	// asserts LB+RB during background battery self-tests at full charge.
-	// This matches upsmon's protected-shutdown semantics, where LB only
-	// triggers action while ONBATT.
-	if cur.Has("LB") && cur.Has("OB") && !(prev.Has("LB") && prev.Has("OB")) {
-		m.emit(ctx, Event{Kind: EventLowBatt, Snapshot: snap, Previous: m.last, Message: m.describe(EventLowBatt, snap)})
 	}
 
 	// Replace-battery debounce — APC BX firmwares flap this token. Hold for
@@ -446,24 +502,20 @@ func (m *Monitor) markCommBad(ctx context.Context, reason string) {
 	}
 }
 
-// handleConnErr classifies an error and tears down the connection on hard
-// failures so the next loop iteration reconnects.
+// handleConnErr tears down a failed connection so the next loop reconnects.
 func (m *Monitor) handleConnErr(ctx context.Context, op string, err error) {
-	if !nut.IsTransient(err) {
-		// Non-recoverable protocol error — log and keep the connection.
-		m.log.Error("nut "+op, "err", err)
+	if ctx.Err() != nil {
 		return
 	}
 	m.log.Warn("nut "+op, "err", err)
-	if m.conn != nil {
-		_ = m.conn.Close()
-		m.conn = nil
-	}
+	// Any failed status or bulk read prevents us from monitoring the UPS,
+	// including protocol errors such as revoked access or a removed UPS.
+	m.closeConn()
 	m.markCommBad(ctx, fmt.Sprintf("%s: %v", op, err))
 }
 
 func (m *Monitor) emit(ctx context.Context, e Event) {
-	if m.sink == nil {
+	if m.sink == nil || ctx.Err() != nil {
 		return
 	}
 	m.log.Info("event", "kind", string(e.Kind), "ups", e.Snapshot.UPS, "status", e.Snapshot.Status)

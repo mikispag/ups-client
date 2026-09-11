@@ -107,8 +107,8 @@ func TestValidateMissingFields(t *testing.T) {
 		`notifications: { shell: [{name: x}] }`,
 		`notifications: { webhook: [{name: x}] }`,
 		`notifications: { ssh: [{name: x, host: h, user: u, command: c}] }`, // missing auth
-		`notifications: { ssh: [{name: x, host: h}] }`,                       // missing user/cmd
-		`notifications: { telegram: [{name: x, bot_token: T}] }`,             // missing chat_id
+		`notifications: { ssh: [{name: x, host: h}] }`,                      // missing user/cmd
+		`notifications: { telegram: [{name: x, bot_token: T}] }`,            // missing chat_id
 	}
 	for i, src := range cases {
 		if _, err := Parse([]byte(src)); err == nil {
@@ -157,5 +157,59 @@ func TestMonitorRuntimeConfig(t *testing.T) {
 	rc := c.MonitorRuntimeConfig()
 	if rc.UPS != "ups" || rc.StatusInterval != 2*time.Second {
 		t.Errorf("rt config: %+v", rc)
+	}
+}
+
+func TestExplicitZeroThresholds(t *testing.T) {
+	c, err := Parse([]byte(`monitor: {nocomm_threshold: 0s, replbatt_debounce: 0s, alarm_debounce: 0s}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Monitor.NoCommThreshold != 0 || c.Monitor.ReplBattDebounce != 0 || c.Monitor.AlarmDebounce != 0 {
+		t.Fatalf("explicit zero thresholds replaced by defaults: %+v", c.Monitor)
+	}
+	defaults, err := Parse([]byte(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if defaults.Monitor.NoCommThreshold != time.Minute || defaults.Monitor.ReplBattDebounce != 10*time.Minute || defaults.Monitor.AlarmDebounce != time.Minute {
+		t.Fatalf("omitted thresholds must retain defaults: %+v", defaults.Monitor)
+	}
+}
+
+func TestParseRejectsUnusableConfig(t *testing.T) {
+	cases := map[string]string{
+		"extra document":          "{}\n---\nnotifications: {}",
+		"empty extra document":    "{}\n---\n",
+		"shell timeout":           `notifications: {shell: [{command: /bin/true, timeout: -1s}]}`,
+		"webhook timeout":         `notifications: {webhook: [{url: https://example.com, timeout: -1s}]}`,
+		"ssh timeout":             `notifications: {ssh: [{host: h, user: u, password: p, command: c, timeout: -1s}]}`,
+		"telegram timeout":        `notifications: {telegram: [{bot_token: T, chat_id: C, timeout: -1s}]}`,
+		"shell template":          `notifications: {shell: [{command: /bin/true, args: ["{{"]}]}`,
+		"webhook body template":   `notifications: {webhook: [{url: https://example.com, body: "{{"}]}`,
+		"webhook URL template":    `notifications: {webhook: [{url: "https://example.com/{{"}]}`,
+		"webhook header template": `notifications: {webhook: [{url: https://example.com, headers: {Title: "{{"}}]}`,
+		"ssh template":            `notifications: {ssh: [{host: h, user: u, password: p, command: "{{"}]}`,
+		"telegram template":       `notifications: {telegram: [{bot_token: T, chat_id: C, message: "{{"}]}`,
+		"webhook scheme":          `notifications: {webhook: [{url: ftp://example.com}]}`,
+		"webhook relative URL":    `notifications: {webhook: [{url: /notify}]}`,
+		"webhook method":          `notifications: {webhook: [{url: https://example.com, method: "GET POST"}]}`,
+		"telegram scheme":         `notifications: {telegram: [{bot_token: T, chat_id: C, api_base: ftp://example.com}]}`,
+		"telegram parse mode":     `notifications: {telegram: [{bot_token: T, chat_id: C, parse_mode: typo}]}`,
+		"ssh negative port":       `notifications: {ssh: [{host: h, port: -1, user: u, password: p, command: c}]}`,
+		"ssh large port":          `notifications: {ssh: [{host: h, port: 65536, user: u, password: p, command: c}]}`,
+	}
+	for name, src := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Parse([]byte(src)); err == nil {
+				t.Fatal("expected validation error")
+			}
+		})
+	}
+}
+
+func TestExampleConfig(t *testing.T) {
+	if _, err := Load("../ups-client.example.yaml"); err != nil {
+		t.Fatal(err)
 	}
 }

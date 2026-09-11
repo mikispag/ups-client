@@ -98,7 +98,7 @@ You'll get an emoji-titled push the next time the mains flicker.
                     (HA, …)
 ```
 
-`ups-client` keeps a long-lived TCP connection to `upsd`, polls `ups.status` every 2 s (matching `upsd`'s `pollinterval`), diffs the token set against the previous reading, and dispatches one event per token edge to every notifier whose event filter matches — all in parallel.
+`ups-client` keeps a long-lived TCP connection to `upsd`, polls `ups.status` every 2 s (matching `upsd`'s `pollinterval`), diffs the token set against the previous reading, and dispatches one event per token edge to every notifier whose event filter matches. Targets run in parallel for each event; events are delivered in order. Polling waits for delivery, so keep notifier timeouts short enough for your required detection latency. Delivery errors are logged; notifications are not retried or persisted.
 
 ## Prerequisites: install the NUT USB drivers
 
@@ -194,7 +194,7 @@ Or directly:
 go build -trimpath -o ups-client .
 ```
 
-The repo targets `go 1.23+`. No CGO.
+The repo targets `go 1.26+`. `make build` disables CGO for a static binary.
 
 ### `make install` layout
 
@@ -220,13 +220,15 @@ CLI flags:
 | Flag | Description |
 |---|---|
 | `-config` | Path to YAML config (default `/etc/ups-client/config.yaml`). |
-| `-check` | Parse and validate the config, then exit. |
+| `-check` | Validate config, template syntax, and enabled NUT TLS CA files, then exit without connecting. |
 | `-list` | Connect, dump every NUT variable, and exit. Handy to inspect what your UPS exposes. |
 | `-v` | Verbose (debug) logging. |
 
 `SIGINT` / `SIGTERM` trigger a clean shutdown.
 
 ## Configuration
+
+Omitted durations use their defaults. Explicit `0s` disables NOCOMM or debounce; polling and NUT I/O durations must be positive. Notifier timeouts default to 10s. Validation checks template syntax without executing commands or contacting endpoints; runtime-only errors and SSH key/trust-file access are checked on delivery.
 
 YAML; see [`ups-client.example.yaml`](./ups-client.example.yaml) for a complete sample. Top-level keys: `nut`, `monitor`, `notifications`.
 
@@ -246,15 +248,17 @@ nut:
     insecure_skip_verify: false
 ```
 
+When `server_name` is omitted, TLS verifies the host from `nut.address`.
+
 ### `monitor`
 
 ```yaml
 monitor:
   status_interval: 2s        # ups.status polling cadence (>= 500ms)
   snapshot_interval: 30s     # bulk LIST VAR cadence
-  nocomm_threshold: 60s      # COMMBAD ➜ NOCOMM after this much sustained loss
-  replbatt_debounce: 600s    # hold RB this long before emitting REPLBATT
-  alarm_debounce: 60s        # hold ALARM this long before emitting ALARM
+  nocomm_threshold: 60s      # sustained loss before NOCOMM; 0s disables
+  replbatt_debounce: 600s    # hold RB before REPLBATT; 0s emits immediately
+  alarm_debounce: 60s        # hold ALARM before notification; 0s emits immediately
   reconnect_backoff: 1s      # initial backoff; doubles, caps at 30s
 ```
 
@@ -420,14 +424,16 @@ ssh:
     known_hosts_file: /etc/ups-client/known_hosts
     # insecure_ignore_host_key: true  # NOT recommended
     command: |
-      logger -t ups "🔔 {{.Event}} on {{.UPS}} status={{.Status}} charge={{.BatteryCharge}}%"
-      case "{{.Event}}" in
+      logger -t ups {{printf "🔔 %s on %s status=%s charge=%s%%" .Event .UPS .Status .BatteryCharge | shellquote}}
+      case {{.Event | shellquote}} in
         ONBATT|LOWBATT|FSD) systemctl stop heavy-job.service ;;
         ONLINE)             systemctl start heavy-job.service ;;
       esac
     timeout: 10s
     events: [ONBATT, LOWBATT, FSD, ONLINE]
 ```
+
+SSH commands are executed by the remote shell. Use `{{.UPS | shellquote}}` for each interpolated shell argument (without surrounding quotes); ordinary local shell target args are passed directly and do not need this escaping.
 
 Generate the trust pin once with `ssh-keyscan -H nas.lan >> /etc/ups-client/known_hosts`.
 
@@ -458,7 +464,7 @@ Detected by diffing successive `ups.status` token sets:
 
 | Event | Trigger |
 |---|---|
-| `STARTUP` | First successful poll after the client launches |
+| `STARTUP` | First successful poll after launch; already-active conditions also emit events, with `FSD`/`LOWBATT` first and debounce still applied to `RB`/`ALARM` |
 | `ONLINE` | `OL` token entered (mains restored) |
 | `ONBATT` | `OB` token entered (running on battery) |
 | `LOWBATT` | `LB` token entered **while `OB` is also present** (bare `LB` on `OL` is noise on APC BX-series and is suppressed) |
@@ -471,7 +477,7 @@ Detected by diffing successive `ups.status` token sets:
 | `CAL` / `NOTCAL` | runtime calibration enter / leave |
 | `OFF` / `NOTOFF` | output `OFF` token enter / leave |
 | `ALARM` / `NOTALARM` | `ALARM` token persists past `alarm_debounce` / leaves after a confirmed alarm. `ups.alarm` is captured and exposed as `{{.Alarm}}` |
-| `COMMBAD` | TCP loss, `DATA-STALE`, or `DRIVER-NOT-CONNECTED` |
+| `COMMBAD` | Connection, protocol, or polling failure, including `DATA-STALE` and `DRIVER-NOT-CONNECTED` |
 | `COMMOK` | recovery from `COMMBAD` |
 | `NOCOMM` | sustained `COMMBAD` past `nocomm_threshold` |
 
@@ -515,9 +521,9 @@ PrivateTmp=yes           # private /tmp namespace
 
 Everything else (`Protect{KernelTunables,KernelModules,ControlGroups}`, `Restrict{Namespaces,Realtime}`, `LockPersonality`, `SystemCallFilter`) is omitted on purpose — those directives only block syscalls this daemon never makes.
 
-### FSD shutdown without sudo
+### Low-battery shutdown without sudo
 
-The example config ships a shell notifier that runs `systemctl --no-block poweroff` on `FSD`. The `ups-client` system user can't trigger a poweroff by default — logind's polkit policy requires an active local session, which a daemon doesn't have. The repo ships a tiny polkit rule that grants exactly the `power-off` / `halt` actions to the `ups-client` user only:
+The example config runs `systemctl --no-block poweroff` on `LOWBATT` (both `OB` and `LB` asserted) or `FSD`. A read-only driver + upsd deployment normally needs the `LOWBATT` trigger: a primary upsmon usually sets `FSD`, and this client does not issue that command or coordinate UPS output cutoff. For coordinated shutdown across multiple hosts, run a primary upsmon and use `FSD` as appropriate. See the [NUT shutdown workflow](https://networkupstools.org/docs/man/upsmon.html). The `ups-client` system user can't trigger a poweroff by default — logind's polkit policy requires an active local session, which a daemon doesn't have. The repo ships a tiny polkit rule that grants exactly the `power-off` / `halt` actions to the `ups-client` user only:
 
 ```bash
 sudo install -m 0644 init/ups-client-poweroff.rules \
@@ -543,7 +549,7 @@ This approach is preferred over editing `/etc/sudoers.d/` (no sudo dependency, n
 | `nut: NUT error: UNKNOWN-UPS` | `nut.ups` doesn't match the section name in `ups.conf`. |
 | Spurious `REPLBATT` | APC BX firmware quirk. Raise `monitor.replbatt_debounce` past the default `600s`, or tighten the driver-side `lbrb_log_delay_sec` in `ups.conf`. See [Tuning the APC-BX flap mitigation](#tuning-the-apc-bx-flap-mitigation). |
 | Spurious `ALARM` lasting a few seconds | APC BX firmware quirk — brief background self-tests assert `ALARM`. The default `monitor.alarm_debounce: 60s` suppresses any blip shorter than a minute. Raise it if you still see noise. The actual reason (when confirmed) is exposed as `{{.Alarm}}` in templates. |
-| Spurious `LOWBATT` while on mains | Should not happen any more: `LOWBATT` only fires when `LB` *and* `OB` are both set, since a bare `LB` on `OL` has no operational meaning (no shutdown is coming) and APC BX-series firmware asserts spurious `LB`+`RB` during background battery self-tests at full charge. If you genuinely want the bare-`LB` signal on `OL`, watch the `STARTUP`/`ONLINE` events instead and inspect `{{.Vars.ups_status}}` from a shell hook. |
+| Spurious `LOWBATT` while on mains | Should not happen any more: `LOWBATT` only fires when `LB` *and* `OB` are both set, since a bare `LB` on `OL` has no operational meaning (no shutdown is coming) and APC BX-series firmware asserts spurious `LB`+`RB` during background battery self-tests at full charge. If you genuinely want the bare-`LB` signal on `OL`, watch the `STARTUP`/`ONLINE` events instead and inspect `{{index .Vars "ups.status"}}` from a shell hook. |
 | `DATA-STALE` floods | The driver lost the device, or BX firmware returned a broken HID report length. Check `dmesg` for USB resets and make sure `maxreport = 1` is set in `ups.conf`. |
 
 ## Development

@@ -84,22 +84,22 @@ func (f Filter) Match(kind monitor.EventKind) bool {
 // TemplateData is the value passed to text/template-rendered fields. It also
 // supplies env vars to shell targets via Env().
 type TemplateData struct {
-	Event           string
-	Message         string
-	UPS             string
-	Status          string
-	PreviousStatus  string
-	Tokens          []string
-	Time            time.Time
-	BatteryCharge   string
-	BatteryRuntime  string
-	InputVoltage    string
-	OutputVoltage   string
-	UPSLoad         string
-	DeviceModel     string
-	DeviceSerial    string
-	Alarm           string
-	Vars            map[string]string
+	Event          string
+	Message        string
+	UPS            string
+	Status         string
+	PreviousStatus string
+	Tokens         []string
+	Time           time.Time
+	BatteryCharge  string
+	BatteryRuntime string
+	InputVoltage   string
+	OutputVoltage  string
+	UPSLoad        string
+	DeviceModel    string
+	DeviceSerial   string
+	Alarm          string
+	Vars           map[string]string
 }
 
 // NewTemplateData builds a TemplateData from a monitor.Event.
@@ -139,9 +139,7 @@ func (td TemplateData) Env() []string {
 		"UPS_TIMESTAMP=" + td.Time.Format(time.RFC3339),
 	}
 	add := func(k, v string) {
-		if v != "" {
-			env = append(env, k+"="+v)
-		}
+		env = append(env, k+"="+v)
 	}
 	add("UPS_BATTERY_CHARGE", td.BatteryCharge)
 	add("UPS_BATTERY_RUNTIME", td.BatteryRuntime)
@@ -159,7 +157,7 @@ func renderTemplate(name, tpl string, td TemplateData) (string, error) {
 	if tpl == "" {
 		return "", nil
 	}
-	t, err := template.New(name).Option("missingkey=zero").Parse(tpl)
+	t, err := parseTemplate(name, tpl)
 	if err != nil {
 		return "", fmt.Errorf("parse %s: %w", name, err)
 	}
@@ -168,6 +166,20 @@ func renderTemplate(name, tpl string, td TemplateData) (string, error) {
 		return "", fmt.Errorf("execute %s: %w", name, err)
 	}
 	return buf.String(), nil
+}
+
+// ValidateTemplate checks template syntax without executing a notification.
+func ValidateTemplate(name, tpl string) error {
+	_, err := parseTemplate(name, tpl)
+	return err
+}
+
+func parseTemplate(name, tpl string) (*template.Template, error) {
+	return template.New(name).Funcs(template.FuncMap{
+		"shellquote": func(s string) string {
+			return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'"
+		},
+	}).Option("missingkey=zero").Parse(tpl)
 }
 
 // defaultMessage produces a fallback notification body when none is configured.

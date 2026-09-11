@@ -8,7 +8,7 @@ Wants=network-online.target nut-server.service
 Type=simple
 User=ups-client
 Group=ups-client
-ExecStart=@BINDIR@/ups-client -config /etc/ups-client/config.yaml
+ExecStart=@BINDIR@/ups-client -config @SYSCONFDIR@/ups-client/config.yaml
 Restart=on-failure
 RestartSec=5s
 

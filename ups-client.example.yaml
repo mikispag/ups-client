@@ -78,7 +78,7 @@ notifications:
           {{- end }} {{ .Event }} ups={{.UPS}} status="{{.Status}}" charge={{.BatteryCharge}}% runtime={{.BatteryRuntime}}s load={{.UPSLoad}}%
       timeout: 5s
 
-    # Immediate local poweroff when the UPS asserts FSD. Uses systemd's
+    # Immediate local poweroff on battery exhaustion (OB+LB) or FSD. Uses systemd's
     # logind D-Bus interface — the unprivileged ups-client user is granted
     # permission via the polkit rule init/ups-client-poweroff.rules
     # (install to /etc/polkit-1/rules.d/50-ups-client-poweroff.rules).
@@ -87,7 +87,7 @@ notifications:
       command: /usr/bin/systemctl
       args: ["--no-block", "poweroff"]
       timeout: 10s
-      events: [FSD]
+      events: [LOWBATT, FSD]
 
   webhook:
     # ntfy.sh — see https://ntfy.sh/
@@ -181,8 +181,8 @@ notifications:
       private_key_file: /etc/ups-client/id_ed25519
       known_hosts_file: /etc/ups-client/known_hosts
       command: |
-        logger -t ups "🔔 {{.Event}} on {{.UPS}} status={{.Status}} charge={{.BatteryCharge}}%"
-        case "{{.Event}}" in
+        logger -t ups {{printf "🔔 %s on %s status=%s charge=%s%%" .Event .UPS .Status .BatteryCharge | shellquote}}
+        case {{.Event | shellquote}} in
           ONBATT|LOWBATT|FSD) systemctl stop heavy-job.service ;;
           ONLINE)             systemctl start heavy-job.service ;;
         esac
